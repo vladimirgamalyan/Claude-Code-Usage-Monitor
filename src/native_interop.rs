@@ -1,17 +1,8 @@
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
-use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
-use windows::Win32::UI::WindowsAndMessaging::*;
-
-// Window style constants
-pub const WS_POPUP_STYLE: u32 = 0x80000000;
-pub const WS_CHILD_STYLE: u32 = 0x40000000;
-pub const WS_CLIPSIBLINGS_STYLE: u32 = 0x04000000;
-
-// Win event constants
-pub const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
-pub const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+};
+use windows::Win32::UI::WindowsAndMessaging::MoveWindow;
 
 // Timer IDs
 pub const TIMER_POLL: usize = 1;
@@ -24,116 +15,6 @@ pub const WM_APP: u32 = 0x8000;
 pub const WM_APP_USAGE_UPDATED: u32 = WM_APP + 1;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
 
-#[derive(Clone, Copy, Debug)]
-pub struct TaskbarWindow {
-    pub hwnd: HWND,
-    pub rect: RECT,
-}
-
-pub fn find_taskbars() -> Vec<TaskbarWindow> {
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let taskbars = &mut *(lparam.0 as *mut Vec<TaskbarWindow>);
-        let mut class_name = [0u16; 64];
-        let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
-        if len > 0 {
-            let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
-            if class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
-                if let Some(rect) = get_taskbar_rect(hwnd).or_else(|| get_window_rect_safe(hwnd)) {
-                    taskbars.push(TaskbarWindow { hwnd, rect });
-                }
-            }
-        }
-        BOOL(1)
-    }
-
-    let mut taskbars: Vec<TaskbarWindow> = Vec::new();
-    unsafe {
-        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut taskbars as *mut _ as isize));
-    }
-    taskbars.sort_by_key(|taskbar| {
-        (
-            taskbar.rect.top,
-            taskbar.rect.left,
-            taskbar.rect.bottom,
-            taskbar.rect.right,
-        )
-    });
-    taskbars
-}
-
-/// Find a child window by class name
-pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
-    unsafe {
-        let class = wide_str(class_name);
-        match FindWindowExW(
-            parent,
-            HWND::default(),
-            PCWSTR::from_raw(class.as_ptr()),
-            PCWSTR::null(),
-        ) {
-            Ok(h) if h != HWND::default() => Some(h),
-            _ => None,
-        }
-    }
-}
-
-/// Get taskbar position via SHAppBarMessage
-pub fn get_taskbar_rect(taskbar_hwnd: HWND) -> Option<RECT> {
-    unsafe {
-        let mut class_name = [0u16; 64];
-        let len = GetClassNameW(taskbar_hwnd, &mut class_name);
-        if len > 0 {
-            let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
-            if class_name == "Shell_SecondaryTrayWnd" {
-                return get_window_rect_safe(taskbar_hwnd);
-            }
-        }
-
-        let mut abd = APPBARDATA {
-            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
-            hWnd: taskbar_hwnd,
-            ..Default::default()
-        };
-        let result = SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd);
-        if result == 0 {
-            return None;
-        }
-        Some(abd.rc)
-    }
-}
-
-/// Get the bounding rectangle of a window
-pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
-    unsafe {
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_ok() {
-            Some(rect)
-        } else {
-            None
-        }
-    }
-}
-
-/// Embed our window as a child of the taskbar
-pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
-    unsafe {
-        // Preserve existing extended style, add tool window + no activate
-        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongW(
-            hwnd,
-            GWL_EXSTYLE,
-            ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
-        );
-
-        // Change from popup to child
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
-        let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
-
-        let _ = SetParent(hwnd, taskbar_hwnd);
-    }
-}
-
 /// Move the window
 pub fn move_window(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
     unsafe {
@@ -141,38 +22,22 @@ pub fn move_window(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
     }
 }
 
-/// Set up a WinEvent hook for tray location changes
-pub fn set_tray_event_hook(
-    thread_id: u32,
-    callback: unsafe extern "system" fn(HWINEVENTHOOK, u32, HWND, i32, i32, u32, u32),
-) -> Option<HWINEVENTHOOK> {
+/// Get the usable desktop area for the monitor nearest to a window.
+pub fn get_monitor_work_area(hwnd: HWND) -> Option<RECT> {
     unsafe {
-        let hook = SetWinEventHook(
-            EVENT_OBJECT_LOCATIONCHANGE,
-            EVENT_OBJECT_LOCATIONCHANGE,
-            None,
-            Some(callback),
-            0,
-            thread_id,
-            WINEVENT_OUTOFCONTEXT,
-        );
-        if hook.is_invalid() {
-            None
-        } else {
-            Some(hook)
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+        if monitor.is_invalid() {
+            return None;
         }
-    }
-}
-
-/// Get the thread ID that owns a window
-pub fn get_window_thread_id(hwnd: HWND) -> u32 {
-    unsafe { GetWindowThreadProcessId(hwnd, None) }
-}
-
-/// Unhook a WinEvent hook
-pub fn unhook_win_event(hook: HWINEVENTHOOK) {
-    unsafe {
-        let _ = UnhookWinEvent(hook);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            Some(info.rcWork)
+        } else {
+            None
+        }
     }
 }
 
