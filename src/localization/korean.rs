@@ -32,6 +32,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_prompt_now: "버전 {version}을 사용할 수 있습니다. 지금 업데이트하시겠습니까?",
     exit: "종료",
     show_widget: "위젯 표시",
+    compact_mode: "컴팩트 모드",
     session_window: "5시간",
     weekly_window: "7일",
     now: "지금",

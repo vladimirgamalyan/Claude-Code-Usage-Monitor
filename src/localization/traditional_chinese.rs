@@ -32,6 +32,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_prompt_now: "版本 {version} 已可用。是否立即更新？",
     exit: "結束",
     show_widget: "顯示小工具",
+    compact_mode: "精簡模式",
     session_window: "5h",
     weekly_window: "7d",
     now: "現在",

@@ -32,6 +32,7 @@ pub(super) const STRINGS: Strings = Strings {
     update_prompt_now: "Versão {version} está disponível. Deseja atualizar agora?",
     exit: "Sair",
     show_widget: "Exibir Widget",
+    compact_mode: "Modo Compacto",
     session_window: "5h",
     weekly_window: "7d",
     now: "agora",

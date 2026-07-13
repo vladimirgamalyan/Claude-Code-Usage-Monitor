@@ -88,6 +88,7 @@ struct AppState {
     menu_active: bool,
 
     widget_visible: bool,
+    compact: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +115,7 @@ const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
+const IDM_TOGGLE_COMPACT: u16 = 32;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
 const IDM_LANG_DUTCH: u16 = 42;
@@ -213,6 +215,8 @@ struct SettingsFile {
     last_update_check_unix: Option<u64>,
     #[serde(default = "default_widget_visible")]
     widget_visible: bool,
+    #[serde(default = "default_compact_mode")]
+    compact_mode: bool,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
@@ -230,6 +234,7 @@ impl Default for SettingsFile {
             language: None,
             last_update_check_unix: None,
             widget_visible: true,
+            compact_mode: false,
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
@@ -243,6 +248,10 @@ fn default_poll_interval() -> u32 {
 
 fn default_widget_visible() -> bool {
     true
+}
+
+fn default_compact_mode() -> bool {
+    false
 }
 
 fn default_show_claude_code() -> bool {
@@ -291,6 +300,7 @@ fn save_state_settings() {
                 .map(|language| language.code().to_string()),
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
+            compact_mode: s.compact,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
@@ -856,8 +866,7 @@ const SEGMENT_GAP: i32 = 1;
 const SEGMENT_COUNT: i32 = 10;
 const CORNER_RADIUS: i32 = 2;
 
-const LEFT_DIVIDER_W: i32 = 3;
-const DIVIDER_RIGHT_MARGIN: i32 = 10;
+const LEFT_MARGIN: i32 = 8;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
@@ -865,6 +874,14 @@ const TEXT_WIDTH: i32 = 62;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
+
+// Compact (single-line) layout dimensions.
+const COMPACT_HEIGHT: i32 = 24;
+const COMPACT_LABEL_W: i32 = 16; // inline "5h"/"7d" label column
+const COMPACT_LABEL_GAP: i32 = 3; // gap between label and value
+const COMPACT_VALUE_W: i32 = 62; // value text column ("100% · 23h")
+const COMPACT_PAIR_GAP: i32 = 10; // gap between the session and weekly pairs
+const COMPACT_MODEL_GAP: i32 = 12; // gap between models
 
 fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
     (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
@@ -884,8 +901,7 @@ fn total_widget_width_for(active_models: i32) -> i32 {
         + sc(BAR_RIGHT_MARGIN)
         + sc(TEXT_WIDTH);
 
-    sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
+    sc(LEFT_MARGIN)
         + sc(LABEL_WIDTH)
         + sc(LABEL_RIGHT_MARGIN)
         + model_width * active_models
@@ -893,23 +909,59 @@ fn total_widget_width_for(active_models: i32) -> i32 {
         + sc(RIGHT_MARGIN)
 }
 
+/// Width of a single model's session+weekly pair in compact mode.
+fn compact_model_width() -> i32 {
+    let pair = sc(COMPACT_LABEL_W) + sc(COMPACT_LABEL_GAP) + sc(COMPACT_VALUE_W);
+    pair + sc(COMPACT_PAIR_GAP) + pair
+}
+
+fn compact_widget_width_for(active_models: i32) -> i32 {
+    sc(LEFT_MARGIN)
+        + compact_model_width() * active_models
+        + sc(COMPACT_MODEL_GAP) * (active_models - 1)
+        + sc(RIGHT_MARGIN)
+}
+
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
+    let active_models = active_model_count(
         state.show_claude_code,
         state.show_codex,
         state.show_antigravity,
-    ))
+    );
+    if state.compact {
+        compact_widget_width_for(active_models)
+    } else {
+        total_widget_width_for(active_models)
+    }
 }
 
 fn total_widget_width() -> i32 {
-    let active_models = {
+    let state = lock_state();
+    match state.as_ref() {
+        Some(s) => total_widget_width_for_state(s),
+        None => total_widget_width_for(1),
+    }
+}
+
+/// Widget height for the given layout mode.
+fn widget_height_for(compact: bool) -> i32 {
+    if compact {
+        sc(COMPACT_HEIGHT)
+    } else {
+        sc(WIDGET_HEIGHT)
+    }
+}
+
+fn widget_height_for_state(state: &AppState) -> i32 {
+    widget_height_for(state.compact)
+}
+
+fn widget_height() -> i32 {
+    let compact = {
         let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or(1)
+        state.as_ref().map(|s| s.compact).unwrap_or(false)
     };
-    total_widget_width_for(active_models)
+    widget_height_for(compact)
 }
 
 fn claude_accent_color() -> Color {
@@ -1030,6 +1082,13 @@ pub fn run() {
             settings.show_codex,
             settings.show_antigravity,
         );
+        let initial_compact = settings.compact_mode;
+        let initial_width = if initial_compact {
+            compact_widget_width_for(initial_model_count)
+        } else {
+            total_widget_width_for(initial_model_count)
+        };
+        let initial_height = widget_height_for(initial_compact);
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -1037,8 +1096,8 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
-            sc(WIDGET_HEIGHT),
+            initial_width,
+            initial_height,
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -1066,8 +1125,8 @@ pub fn run() {
         diagnose::log(format!("main window created hwnd={:?}", hwnd));
 
         let is_dark = theme::is_dark_mode();
-        let widget_width = total_widget_width_for(initial_model_count);
-        let widget_height = sc(WIDGET_HEIGHT);
+        let widget_width = initial_width;
+        let widget_height = initial_height;
         let (default_x, default_y) = default_window_position(hwnd, widget_width, widget_height);
         let window_x = settings.window_x.unwrap_or(default_x);
         let window_y = settings.window_y.unwrap_or(default_y);
@@ -1114,6 +1173,7 @@ pub fn run() {
                 drag_start_window_y: window_y,
                 menu_active: false,
                 widget_visible: settings.widget_visible,
+                compact: settings.compact_mode,
             });
         }
 
@@ -1237,44 +1297,7 @@ fn paint_content(
         FillRect(hdc, &client_rect, bg_brush);
         let _ = DeleteObject(bg_brush);
 
-        // Left divider
-        let divider_h = sc(25);
-        let divider_top = (height - divider_h) / 2;
-        let divider_bottom = divider_top + divider_h;
-
-        let (div_left, div_right) = if is_dark {
-            ((80, 80, 80), (40, 40, 40))
-        } else {
-            ((160, 160, 160), (230, 230, 230))
-        };
-
-        let left_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
-            div_left.0, div_left.1, div_left.2,
-        )));
-        let left_rect = RECT {
-            left: 0,
-            top: divider_top,
-            right: sc(2),
-            bottom: divider_bottom,
-        };
-        FillRect(hdc, &left_rect, left_brush);
-        let _ = DeleteObject(left_brush);
-
-        let right_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
-            div_right.0,
-            div_right.1,
-            div_right.2,
-        )));
-        let right_rect = RECT {
-            left: sc(2),
-            top: divider_top,
-            right: sc(3),
-            bottom: divider_bottom,
-        };
-        FillRect(hdc, &right_rect, right_brush);
-        let _ = DeleteObject(right_brush);
-
-        let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+        let content_x = sc(LEFT_MARGIN);
         let row2_y = height - sc(5) - sc(SEGMENT_H);
         let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
 
@@ -1345,6 +1368,199 @@ fn paint_content(
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
+    }
+}
+
+/// Paint the compact (single-line) widget layout: per model, the session and
+/// weekly usage texts side by side, without the segmented bars.
+#[allow(clippy::too_many_arguments)]
+fn paint_compact(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    is_dark: bool,
+    bg: &Color,
+    text_color: &Color,
+    strings: Strings,
+    session_text: &str,
+    weekly_text: &str,
+    codex_session_text: &str,
+    codex_weekly_text: &str,
+    antigravity_session_text: &str,
+    antigravity_weekly_text: &str,
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+) {
+    unsafe {
+        let client_rect = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let bg_brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
+        FillRect(hdc, &client_rect, bg_brush);
+        let _ = DeleteObject(bg_brush);
+
+        let _ = SetBkMode(hdc, TRANSPARENT);
+
+        let font_name = native_interop::wide_str("Segoe UI");
+        let font = CreateFontW(
+            sc(-12),
+            0,
+            0,
+            0,
+            FW_MEDIUM.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        let old_font = SelectObject(hdc, font);
+
+        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+        let use_model_text_colors = active_models > 1;
+        let claude_value_color = if use_model_text_colors {
+            claude_usage_text_color(is_dark)
+        } else {
+            *text_color
+        };
+        let codex_value_color = if use_model_text_colors {
+            codex_usage_text_color(is_dark)
+        } else {
+            *text_color
+        };
+        let antigravity_value_color = if use_model_text_colors {
+            antigravity_usage_text_color(is_dark)
+        } else {
+            *text_color
+        };
+
+        let mut model_x = sc(LEFT_MARGIN);
+        if show_claude_code {
+            draw_compact_model(
+                hdc,
+                model_x,
+                height,
+                text_color,
+                strings,
+                session_text,
+                weekly_text,
+                &claude_value_color,
+            );
+            model_x += compact_model_width() + sc(COMPACT_MODEL_GAP);
+        }
+        if show_codex {
+            draw_compact_model(
+                hdc,
+                model_x,
+                height,
+                text_color,
+                strings,
+                codex_session_text,
+                codex_weekly_text,
+                &codex_value_color,
+            );
+            model_x += compact_model_width() + sc(COMPACT_MODEL_GAP);
+        }
+        if show_antigravity {
+            draw_compact_model(
+                hdc,
+                model_x,
+                height,
+                text_color,
+                strings,
+                antigravity_session_text,
+                antigravity_weekly_text,
+                &antigravity_value_color,
+            );
+        }
+
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+    }
+}
+
+/// Draw one model's compact entry: "5h {session}   7d {weekly}".
+#[allow(clippy::too_many_arguments)]
+fn draw_compact_model(
+    hdc: HDC,
+    x: i32,
+    height: i32,
+    label_color: &Color,
+    strings: Strings,
+    session_text: &str,
+    weekly_text: &str,
+    value_color: &Color,
+) {
+    let pair_w = sc(COMPACT_LABEL_W) + sc(COMPACT_LABEL_GAP) + sc(COMPACT_VALUE_W);
+    draw_compact_pair(
+        hdc,
+        x,
+        height,
+        label_color,
+        strings.session_window,
+        session_text,
+        value_color,
+    );
+    draw_compact_pair(
+        hdc,
+        x + pair_w + sc(COMPACT_PAIR_GAP),
+        height,
+        label_color,
+        strings.weekly_window,
+        weekly_text,
+        value_color,
+    );
+}
+
+/// Draw a single "{label} {value}" pair, vertically centered in the row.
+fn draw_compact_pair(
+    hdc: HDC,
+    x: i32,
+    height: i32,
+    label_color: &Color,
+    label: &str,
+    value: &str,
+    value_color: &Color,
+) {
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(label_color.to_colorref()));
+        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+        let mut label_rect = RECT {
+            left: x,
+            top: 0,
+            right: x + sc(COMPACT_LABEL_W),
+            bottom: height,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut label_wide,
+            &mut label_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        let value_x = x + sc(COMPACT_LABEL_W) + sc(COMPACT_LABEL_GAP);
+        let _ = SetTextColor(hdc, COLORREF(value_color.to_colorref()));
+        let mut value_wide: Vec<u16> = value.encode_utf16().collect();
+        let mut value_rect = RECT {
+            left: value_x,
+            top: 0,
+            right: value_x + sc(COMPACT_VALUE_W),
+            bottom: height,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut value_wide,
+            &mut value_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
     }
 }
 
@@ -1641,7 +1857,7 @@ fn position_window() {
     };
 
     let width = total_widget_width();
-    let height = sc(WIDGET_HEIGHT);
+    let height = widget_height();
     native_interop::move_window(hwnd, x, y, width, height);
     unsafe {
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
@@ -1812,7 +2028,7 @@ unsafe extern "system" fn wnd_proc(
                         s.window_x,
                         s.window_y,
                         total_widget_width_for_state(s),
-                        sc(WIDGET_HEIGHT),
+                        widget_height_for_state(s),
                     )
                 };
                 let (hwnd_val, x, y, widget_width, widget_height) = move_target;
@@ -1901,7 +2117,7 @@ unsafe extern "system" fn wnd_proc(
                 }
                 IDM_RESET_POSITION => {
                     let width = total_widget_width();
-                    let height = sc(WIDGET_HEIGHT);
+                    let height = widget_height();
                     let (x, y) = default_window_position(hwnd, width, height);
                     {
                         let mut state = lock_state();
@@ -2007,6 +2223,23 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                     render_layered();
                 }
+                IDM_TOGGLE_COMPACT => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            let new_compact = !s.compact;
+                            // Keep the bottom edge anchored so the widget doesn't
+                            // jump when the height changes.
+                            let old_h = widget_height_for(s.compact);
+                            let new_h = widget_height_for(new_compact);
+                            s.window_y += old_h - new_h;
+                            s.compact = new_compact;
+                        }
+                    }
+                    save_state_settings();
+                    position_window();
+                    render_layered();
+                }
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
@@ -2045,6 +2278,7 @@ fn show_context_menu(hwnd: HWND) {
             install_channel,
             update_status,
             widget_visible,
+            compact,
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -2059,6 +2293,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.install_channel,
                     s.update_status.clone(),
                     s.widget_visible,
+                    s.compact,
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
@@ -2071,6 +2306,7 @@ fn show_context_menu(hwnd: HWND) {
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
                     true,
+                    false,
                     true,
                     false,
                     false,
@@ -2282,6 +2518,19 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(widget_label.as_ptr()),
         );
 
+        let compact_label = native_interop::wide_str(strings.compact_mode);
+        let compact_flags = if compact {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            menu,
+            compact_flags,
+            IDM_TOGGLE_COMPACT as usize,
+            PCWSTR::from_raw(compact_label.as_ptr()),
+        );
+
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let exit_str = native_interop::wide_str(strings.exit);
@@ -2333,6 +2582,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_claude_code,
         show_codex,
         show_antigravity,
+        compact,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -2354,6 +2604,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.compact,
             ),
             None => return,
         }
@@ -2392,34 +2643,55 @@ fn paint(hdc: HDC, hwnd: HWND) {
         let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
         let old_bmp = SelectObject(mem_dc, mem_bmp);
 
-        paint_content(
-            mem_dc,
-            width,
-            height,
-            is_dark,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
-            strings,
-            session_pct,
-            &session_text,
-            weekly_pct,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            &codex_accent,
-            &antigravity_accent,
-        );
+        if compact {
+            paint_compact(
+                mem_dc,
+                width,
+                height,
+                is_dark,
+                &bg_color,
+                &text_color,
+                strings,
+                &session_text,
+                &weekly_text,
+                &codex_session_text,
+                &codex_weekly_text,
+                &antigravity_session_text,
+                &antigravity_weekly_text,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+            );
+        } else {
+            paint_content(
+                mem_dc,
+                width,
+                height,
+                is_dark,
+                &bg_color,
+                &text_color,
+                &accent,
+                &track,
+                strings,
+                session_pct,
+                &session_text,
+                weekly_pct,
+                &weekly_text,
+                codex_session_pct,
+                &codex_session_text,
+                codex_weekly_pct,
+                &codex_weekly_text,
+                antigravity_session_pct,
+                &antigravity_session_text,
+                antigravity_weekly_pct,
+                &antigravity_weekly_text,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+                &codex_accent,
+                &antigravity_accent,
+            );
+        }
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
 
