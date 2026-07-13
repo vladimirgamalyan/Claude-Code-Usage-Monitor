@@ -85,6 +85,7 @@ struct AppState {
     drag_start_mouse_y: i32,
     drag_start_window_x: i32,
     drag_start_window_y: i32,
+    menu_active: bool,
 
     widget_visible: bool,
 }
@@ -1111,6 +1112,7 @@ pub fn run() {
                 drag_start_mouse_y: 0,
                 drag_start_window_x: window_x,
                 drag_start_window_y: window_y,
+                menu_active: false,
                 widget_visible: settings.widget_visible,
             });
         }
@@ -1761,6 +1763,15 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_SETCURSOR => {
+            // While the context menu is open, let the default arrow cursor win;
+            // otherwise the move cursor "sticks" as a cross over the menu.
+            let menu_active = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.menu_active).unwrap_or(false)
+            };
+            if menu_active {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
             let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEALL).unwrap_or_default();
             SetCursor(cursor);
             LRESULT(1)
@@ -2284,7 +2295,20 @@ fn show_context_menu(hwnd: HWND) {
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(hwnd);
+
+        // Suppress the move cursor while the menu is up and reset it to the
+        // arrow so it doesn't stay stuck as a cross over the menu.
+        if let Some(s) = lock_state().as_mut() {
+            s.menu_active = true;
+        }
+        let arrow = LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default();
+        SetCursor(arrow);
+
         let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
+
+        if let Some(s) = lock_state().as_mut() {
+            s.menu_active = false;
+        }
         let _ = DestroyMenu(menu);
     }
 }
