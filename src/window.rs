@@ -308,81 +308,65 @@ fn save_state_settings() {
     }
 }
 
-fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
+fn tray_tooltip_from_state() -> Option<String> {
     let state = lock_state();
     match state.as_ref() {
         Some(s) if s.last_poll_ok => {
-            let mut icons = Vec::new();
+            let mut lines = Vec::new();
             if s.show_claude_code {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: Some(s.session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().claude_code_model,
-                        s.session_text,
-                        s.weekly_text
-                    ),
-                });
+                lines.push(format!(
+                    "{} 5h: {} | 7d: {}",
+                    s.language.strings().claude_code_model,
+                    s.session_text,
+                    s.weekly_text
+                ));
             }
             if s.show_codex {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: Some(s.codex_session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().codex_model,
-                        s.codex_session_text,
-                        s.codex_weekly_text
-                    ),
-                });
+                lines.push(format!(
+                    "{} 5h: {} | 7d: {}",
+                    s.language.strings().codex_model,
+                    s.codex_session_text,
+                    s.codex_weekly_text
+                ));
             }
             if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: Some(s.antigravity_session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().antigravity_model,
-                        s.antigravity_session_text,
-                        s.antigravity_weekly_text
-                    ),
-                });
+                lines.push(format!(
+                    "{} 5h: {} | 7d: {}",
+                    s.language.strings().antigravity_model,
+                    s.antigravity_session_text,
+                    s.antigravity_weekly_text
+                ));
             }
-            icons
+            if lines.is_empty() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
         }
         Some(s) => {
-            let mut icons = Vec::new();
+            let mut lines = Vec::new();
             if s.show_claude_code {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: None,
-                    tooltip: s.language.strings().window_title.to_string(),
-                });
+                lines.push(s.language.strings().window_title.to_string());
             }
             if s.show_codex {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: None,
-                    tooltip: s.language.strings().codex_window_title.to_string(),
-                });
+                lines.push(s.language.strings().codex_window_title.to_string());
             }
             if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: None,
-                    tooltip: s.language.strings().antigravity_window_title.to_string(),
-                });
+                lines.push(s.language.strings().antigravity_window_title.to_string());
             }
-            icons
+            if lines.is_empty() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
         }
-        None => Vec::new(),
+        None => None,
     }
 }
 
 fn sync_tray_icons(hwnd: HWND) {
-    let icons = tray_icon_data_from_state();
-    tray_icon::sync(hwnd, &icons);
+    let tooltip = tray_tooltip_from_state();
+    tray_icon::sync(hwnd, tooltip.as_deref());
 }
 
 fn toggle_widget_visibility(hwnd: HWND) {
@@ -1711,30 +1695,24 @@ fn do_poll(send_hwnd: SendHwnd) {
                     state.as_ref().map(|s| {
                         if s.show_claude_code {
                             (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Claude,
                                 s.language.strings().token_expired_title,
                                 s.language.strings().token_expired_body,
                             )
                         } else if s.show_codex {
                             (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Codex,
                                 s.language.strings().codex_token_expired_title,
                                 s.language.strings().codex_token_expired_body,
                             )
                         } else {
                             (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Antigravity,
                                 s.language.strings().antigravity_token_expired_title,
                                 s.language.strings().antigravity_token_expired_body,
                             )
                         }
                     })
                 };
-                if let Some((_strings, kind, title, body)) = balloon {
-                    tray_icon::notify_balloon(hwnd, kind, title, body);
+                if let Some((title, body)) = balloon {
+                    tray_icon::notify_balloon(hwnd, title, body);
                 }
             }
 
@@ -2260,7 +2238,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            tray_icon::remove_all(hwnd);
+            tray_icon::remove(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
         }

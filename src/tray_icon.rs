@@ -8,11 +8,9 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::native_interop::{self, Color, WM_APP_TRAY};
+use crate::native_interop::{Color, WM_APP_TRAY};
 
-const CLAUDE_TRAY_ICON_ID: u32 = 1;
-const CODEX_TRAY_ICON_ID: u32 = 2;
-const ANTIGRAVITY_TRAY_ICON_ID: u32 = 3;
+const TRAY_ICON_ID: u32 = 1;
 
 /// Menu item ID for toggling widget visibility (used by window.rs context menu).
 pub const IDM_TOGGLE_WIDGET: u16 = 70;
@@ -24,137 +22,20 @@ pub enum TrayAction {
     ShowContextMenu,
 }
 
-#[derive(Clone, Copy)]
-pub enum TrayIconKind {
-    Claude,
-    Codex,
-    Antigravity,
-}
-
-pub struct TrayIconData {
-    pub kind: TrayIconKind,
-    pub percent: Option<f64>,
-    pub tooltip: String,
-}
-
-impl TrayIconKind {
-    fn id(self) -> u32 {
-        match self {
-            Self::Claude => CLAUDE_TRAY_ICON_ID,
-            Self::Codex => CODEX_TRAY_ICON_ID,
-            Self::Antigravity => ANTIGRAVITY_TRAY_ICON_ID,
-        }
+/// Create the tray icon. Uses the embedded app icon; falls back to a plain
+/// brand-coloured badge (no text/digits) if extraction fails.
+fn create_icon() -> HICON {
+    let app_icon = load_embedded_app_icon();
+    if !app_icon.is_invalid() {
+        return app_icon;
     }
+    create_fallback_icon()
 }
 
-fn lerp_channel(start: u8, end: u8, t: f64) -> u8 {
-    (start as f64 + (end as f64 - start as f64) * t.clamp(0.0, 1.0)).round() as u8
-}
-
-fn lerp_color(start: Color, end: Color, t: f64) -> Color {
-    Color::new(
-        lerp_channel(start.r, end.r, t),
-        lerp_channel(start.g, end.g, t),
-        lerp_channel(start.b, end.b, t),
-    )
-}
-
-fn interpolated_fill(percent: f64) -> Color {
-    if percent <= 50.0 {
-        return Color::from_hex("#D97757");
-    }
-
-    let stops = [
-        (50.0, Color::from_hex("#D97757")),
-        (70.0, Color::from_hex("#D08540")),
-        (85.0, Color::from_hex("#CC8C20")),
-        (95.0, Color::from_hex("#C45020")),
-        (100.0, Color::from_hex("#B82020")),
-    ];
-
-    for pair in stops.windows(2) {
-        let (start_pct, start_color) = pair[0];
-        let (end_pct, end_color) = pair[1];
-        if percent <= end_pct {
-            let span = (end_pct - start_pct).max(f64::EPSILON);
-            let t = (percent - start_pct) / span;
-            return lerp_color(start_color, end_color, t);
-        }
-    }
-
-    stops[stops.len() - 1].1
-}
-
-fn codex_fill(percent: f64) -> Color {
-    if percent >= 90.0 {
-        Color::from_hex("#FFFFFF")
-    } else {
-        Color::from_hex("#111111")
-    }
-}
-
-fn antigravity_fill(percent: f64) -> Color {
-    if percent >= 90.0 {
-        Color::from_hex("#FFFFFF")
-    } else {
-        Color::from_hex("#4285F4")
-    }
-}
-
-/// Create a rounded-rectangle tray icon badge showing the usage percentage.
-/// For Claude, `percent` = None uses the embedded app icon as the loading state.
-/// For Codex and Antigravity, `percent` = None uses a provider placeholder badge.
-pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
-    if matches!(kind, TrayIconKind::Claude) && percent.is_none() {
-        let app_icon = load_embedded_app_icon();
-        if !app_icon.is_invalid() {
-            return app_icon;
-        }
-    }
-
+fn create_fallback_icon() -> HICON {
     let size = 64_i32;
-    let margin = 0_i32;
     let radius = 2_i32;
-    let outline = if matches!(kind, TrayIconKind::Codex | TrayIconKind::Antigravity) {
-        3_i32
-    } else {
-        0_i32
-    };
-
-    let fill = match kind {
-        TrayIconKind::Claude => interpolated_fill(percent.unwrap_or(0.0)),
-        TrayIconKind::Codex => codex_fill(percent.unwrap_or(0.0)),
-        TrayIconKind::Antigravity => antigravity_fill(percent.unwrap_or(0.0)),
-    };
-    let text_col = match kind {
-        TrayIconKind::Claude => Color::from_hex("#FFFFFF"),
-        TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#111111"),
-        TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
-        TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#1967D2"),
-        TrayIconKind::Antigravity => Color::from_hex("#FFFFFF"),
-    };
-    let outline_col = match kind {
-        TrayIconKind::Claude => fill,
-        TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#111111"),
-        TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
-        TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#1967D2"),
-        TrayIconKind::Antigravity => Color::from_hex("#FFFFFF"),
-    };
-
-    let display_text = match percent {
-        Some(p) => format!("{}", p.round().clamp(0.0, 999.0) as u32),
-        None => match kind {
-            TrayIconKind::Claude => String::new(),
-            TrayIconKind::Codex => "C".to_string(),
-            TrayIconKind::Antigravity => "A".to_string(),
-        },
-    };
-
-    let font_h = match display_text.len() {
-        1 => -50,
-        2 => -42,
-        _ => -30,
-    };
+    let fill = Color::from_hex("#D97757");
 
     unsafe {
         let screen_dc = GetDC(HWND::default());
@@ -191,80 +72,17 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
             *px = 0;
         }
 
-        // Draw rounded rectangle badge
+        // Draw solid rounded-rectangle badge, no outline, no text
         let null_pen = GetStockObject(NULL_PEN);
         let old_pen = SelectObject(mem_dc, null_pen);
 
-        if outline > 0 {
-            let br_outline = CreateSolidBrush(COLORREF(outline_col.to_colorref()));
-            let old_brush = SelectObject(mem_dc, br_outline);
-            let _ = RoundRect(
-                mem_dc,
-                margin,
-                margin,
-                size - margin + 1,
-                size - margin + 1,
-                (radius + 1) * 2,
-                (radius + 1) * 2,
-            );
-            SelectObject(mem_dc, old_brush);
-            let _ = DeleteObject(br_outline);
-        }
-
         let br_fill = CreateSolidBrush(COLORREF(fill.to_colorref()));
         let old_brush = SelectObject(mem_dc, br_fill);
-        let _ = RoundRect(
-            mem_dc,
-            margin + outline,
-            margin + outline,
-            size - margin - outline + 1,
-            size - margin - outline + 1,
-            (radius - 1) * 2,
-            (radius - 1) * 2,
-        );
+        let _ = RoundRect(mem_dc, 0, 0, size + 1, size + 1, radius * 2, radius * 2);
 
         SelectObject(mem_dc, old_brush);
         SelectObject(mem_dc, old_pen);
         let _ = DeleteObject(br_fill);
-
-        // Draw centered percentage text
-        let font_name = native_interop::wide_str("Arial Bold");
-        let font = CreateFontW(
-            font_h,
-            0,
-            0,
-            0,
-            FW_BOLD.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            ANTIALIASED_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(font_name.as_ptr()),
-        );
-        let old_font = SelectObject(mem_dc, font);
-        let _ = SetBkMode(mem_dc, TRANSPARENT);
-        let _ = SetTextColor(mem_dc, COLORREF(text_col.to_colorref()));
-
-        let mut text_rect = RECT {
-            left: margin,
-            top: margin,
-            right: size - margin,
-            bottom: size - margin,
-        };
-        let mut text_wide: Vec<u16> = display_text.encode_utf16().collect();
-        let _ = DrawTextW(
-            mem_dc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-
-        SelectObject(mem_dc, old_font);
-        let _ = DeleteObject(font);
 
         // Set alpha: non-zero BGR pixel -> fully opaque; background stays transparent
         for px in pixel_data.iter_mut() {
@@ -332,12 +150,12 @@ fn load_embedded_app_icon() -> HICON {
 
 /// Show a Windows balloon notification from the tray icon.
 /// Used to alert the user when re-authentication is required.
-pub fn notify_balloon(hwnd: HWND, kind: TrayIconKind, title: &str, message: &str) {
+pub fn notify_balloon(hwnd: HWND, title: &str, message: &str) {
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
-        nid.uID = kind.id();
+        nid.uID = TRAY_ICON_ID;
         nid.uFlags = NIF_INFO;
         nid.dwInfoFlags = NIIF_WARNING;
         copy_wide(title, &mut nid.szInfoTitle);
@@ -360,13 +178,13 @@ fn copy_wide_256(s: &str, buf: &mut [u16; 256]) {
 }
 
 /// Register the tray icon with the shell.
-pub fn add(hwnd: HWND, kind: TrayIconKind, percent: Option<f64>, tooltip: &str) {
-    let hicon = create_icon(kind, percent);
+pub fn add(hwnd: HWND, tooltip: &str) {
+    let hicon = create_icon();
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
-        nid.uID = kind.id();
+        nid.uID = TRAY_ICON_ID;
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_APP_TRAY;
         nid.hIcon = hicon;
@@ -378,14 +196,14 @@ pub fn add(hwnd: HWND, kind: TrayIconKind, percent: Option<f64>, tooltip: &str) 
     }
 }
 
-/// Update the tray icon colour and tooltip to reflect current usage.
-pub fn update(hwnd: HWND, kind: TrayIconKind, percent: Option<f64>, tooltip: &str) {
-    let hicon = create_icon(kind, percent);
+/// Update the tray icon tooltip to reflect current usage.
+pub fn update(hwnd: HWND, tooltip: &str) {
+    let hicon = create_icon();
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
-        nid.uID = kind.id();
+        nid.uID = TRAY_ICON_ID;
         nid.uFlags = NIF_ICON | NIF_TIP;
         nid.hIcon = hicon;
         copy_to_tip(tooltip, &mut nid.szTip);
@@ -397,53 +215,26 @@ pub fn update(hwnd: HWND, kind: TrayIconKind, percent: Option<f64>, tooltip: &st
 }
 
 /// Remove the tray icon from the shell.
-pub fn remove(hwnd: HWND, kind: TrayIconKind) {
+pub fn remove(hwnd: HWND) {
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
-        nid.uID = kind.id();
+        nid.uID = TRAY_ICON_ID;
         let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
     }
 }
 
-pub fn sync(hwnd: HWND, icons: &[TrayIconData]) {
-    let show_claude = icons
-        .iter()
-        .find(|icon| matches!(icon.kind, TrayIconKind::Claude));
-    let show_codex = icons
-        .iter()
-        .find(|icon| matches!(icon.kind, TrayIconKind::Codex));
-    let show_antigravity = icons
-        .iter()
-        .find(|icon| matches!(icon.kind, TrayIconKind::Antigravity));
-
-    if let Some(icon) = show_claude {
-        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
-        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
-    } else {
-        remove(hwnd, TrayIconKind::Claude);
+/// Show/update the single tray icon with the given tooltip, or remove it
+/// when no provider is enabled (`tooltip` is `None`).
+pub fn sync(hwnd: HWND, tooltip: Option<&str>) {
+    match tooltip {
+        Some(tip) => {
+            add(hwnd, tip);
+            update(hwnd, tip);
+        }
+        None => remove(hwnd),
     }
-
-    if let Some(icon) = show_codex {
-        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
-        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
-    } else {
-        remove(hwnd, TrayIconKind::Codex);
-    }
-
-    if let Some(icon) = show_antigravity {
-        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
-        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
-    } else {
-        remove(hwnd, TrayIconKind::Antigravity);
-    }
-}
-
-pub fn remove_all(hwnd: HWND) {
-    remove(hwnd, TrayIconKind::Claude);
-    remove(hwnd, TrayIconKind::Codex);
-    remove(hwnd, TrayIconKind::Antigravity);
 }
 
 /// Interpret a tray callback message and return the action to take.
