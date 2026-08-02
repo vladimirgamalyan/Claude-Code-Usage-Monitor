@@ -10,8 +10,9 @@ use serde::Deserialize;
 use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
-use crate::localization::Strings;
+use crate::http;
 use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::strings;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -81,6 +82,8 @@ struct CodexRateLimitDetails {
 struct CodexRateLimitWindow {
     used_percent: f64,
     reset_at: i64,
+    /// Length of the window itself, e.g. 18000 for 5 hours or 604800 for 7 days.
+    limit_window_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -555,12 +558,14 @@ fn resolve_windows_codex_path() -> String {
     "codex.cmd".to_string()
 }
 
-fn build_agent() -> Result<ureq::Agent, PollError> {
-    let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
-    Ok(ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .tls_connector(std::sync::Arc::new(tls))
-        .build())
+/// 401/403 mean the stored token no longer works, which the UI turns into a
+/// re-login prompt rather than a generic failure.
+fn is_auth_error(status: u16) -> bool {
+    status == 401 || status == 403
+}
+
+fn is_success(status: u16) -> bool {
+    (200..300).contains(&status)
 }
 
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
@@ -596,8 +601,28 @@ fn all_known_credential_sources() -> Vec<CredentialSource> {
     sources
 }
 
+/// The user's Windows profile directory. Reads the same environment the shell
+/// hands every process, so no extra crate is needed to resolve it.
+fn home_dir() -> Option<PathBuf> {
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        if !profile.is_empty() {
+            return Some(PathBuf::from(profile));
+        }
+    }
+
+    let drive = std::env::var_os("HOMEDRIVE")?;
+    let path = std::env::var_os("HOMEPATH")?;
+    if drive.is_empty() || path.is_empty() {
+        return None;
+    }
+
+    let mut home = drive;
+    home.push(&path);
+    Some(PathBuf::from(home))
+}
+
 fn windows_credential_source() -> Option<CredentialSource> {
-    let home = dirs::home_dir()?;
+    let home = home_dir()?;
     Some(CredentialSource::Windows(
         home.join(".claude").join(".credentials.json"),
     ))
@@ -685,27 +710,30 @@ fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
 }
 
 fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
-    let agent = build_agent()?;
-
-    let resp = match agent
-        .get(USAGE_URL)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("anthropic-beta", "oauth-2025-04-20")
+    let resp = match http::get(USAGE_URL)
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("anthropic-beta", "oauth-2025-04-20")
         .call()
     {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "usage endpoint returned auth error status {code}; re-login required"
-            ));
-            return Err(PollError::AuthRequired);
-        }
         Err(_) => return Ok(None),
     };
 
-    let response: UsageResponse = match resp.into_json() {
-        Ok(response) => response,
-        Err(_) => return Ok(None),
+    let code = resp.status();
+    if is_auth_error(code) {
+        diagnose::log(format!(
+            "usage endpoint returned auth error status {code}; re-login required"
+        ));
+        return Err(PollError::AuthRequired);
+    }
+
+    if !is_success(code) {
+        return Ok(None);
+    }
+
+    let response: UsageResponse = match resp.json() {
+        Some(response) => response,
+        None => return Ok(None),
     };
     let mut data = UsageData::default();
 
@@ -723,8 +751,6 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
 }
 
 fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
-
     for model in MODEL_FALLBACK_CHAIN {
         let body = serde_json::json!({
             "model": model,
@@ -732,23 +758,25 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
             "messages": [{"role": "user", "content": "."}]
         });
 
-        let response = match agent
-            .post(MESSAGES_URL)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("anthropic-version", "2023-06-01")
-            .set("anthropic-beta", "oauth-2025-04-20")
+        // A rejected request still carries the rate-limit headers this reads, so
+        // any status other than an auth failure is worth inspecting.
+        let response = match http::post(MESSAGES_URL)
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "oauth-2025-04-20")
             .send_json(&body)
         {
             Ok(resp) => resp,
-            Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-                diagnose::log(format!(
-                    "messages endpoint returned auth error status {code}; re-login required"
-                ));
-                return Err(PollError::AuthRequired);
-            }
-            Err(ureq::Error::Status(_code, resp)) => resp,
             Err(_) => continue,
         };
+
+        let code = response.status();
+        if is_auth_error(code) {
+            diagnose::log(format!(
+                "messages endpoint returned auth error status {code}; re-login required"
+            ));
+            return Err(PollError::AuthRequired);
+        }
 
         let h5 = response.header("anthropic-ratelimit-unified-5h-utilization");
         let h7 = response.header("anthropic-ratelimit-unified-7d-utilization");
@@ -762,7 +790,7 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
     Err(PollError::RequestFailed)
 }
 
-fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
+fn parse_rate_limit_headers(response: &http::Response) -> UsageData {
     let mut data = UsageData::default();
 
     data.session.percentage =
@@ -801,34 +829,39 @@ fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
 }
 
 fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
-    let mut request = agent
-        .get(CODEX_USAGE_URL)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("User-Agent", "codex-cli");
+    let mut request = http::get(CODEX_USAGE_URL)
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("User-Agent", "codex-cli");
 
     if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
-        request = request.set("ChatGPT-Account-Id", account_id);
+        request = request.header("ChatGPT-Account-Id", account_id);
     }
 
     let resp = match request.call() {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "Codex usage endpoint returned auth error status {code}; refresh required"
-            ));
-            return Err(PollError::AuthRequired);
-        }
         Err(error) => {
             diagnose::log_error("Codex usage endpoint request failed", error);
             return Err(PollError::RequestFailed);
         }
     };
 
-    let response: CodexUsageResponse = match resp.into_json() {
-        Ok(response) => response,
-        Err(error) => {
-            diagnose::log_error("unable to parse Codex usage response", error);
+    let code = resp.status();
+    if is_auth_error(code) {
+        diagnose::log(format!(
+            "Codex usage endpoint returned auth error status {code}; refresh required"
+        ));
+        return Err(PollError::AuthRequired);
+    }
+
+    if !is_success(code) {
+        diagnose::log(format!("Codex usage endpoint returned status {code}"));
+        return Err(PollError::RequestFailed);
+    }
+
+    let response: CodexUsageResponse = match resp.json() {
+        Some(response) => response,
+        None => {
+            diagnose::log("unable to parse Codex usage response");
             return Err(PollError::RequestFailed);
         }
     };
@@ -836,16 +869,44 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
     codex_usage_from_response(response).ok_or(PollError::RequestFailed)
 }
 
+/// Windows longer than this belong in the weekly row, shorter ones in the 5h row.
+const CODEX_WEEKLY_WINDOW_THRESHOLD_SECS: i64 = 24 * 60 * 60;
+
+fn codex_window_is_weekly(window: &CodexRateLimitWindow) -> Option<bool> {
+    window
+        .limit_window_seconds
+        .map(|seconds| seconds > CODEX_WEEKLY_WINDOW_THRESHOLD_SECS)
+}
+
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
     let details = *response.rate_limit.flatten()?;
     let mut data = UsageData::default();
 
-    if let Some(window) = details.primary_window.flatten() {
-        data.session = codex_section_from_window(&window);
-    }
-
-    if let Some(window) = details.secondary_window.flatten() {
-        data.weekly = codex_section_from_window(&window);
+    match (
+        details.primary_window.flatten(),
+        details.secondary_window.flatten(),
+    ) {
+        // A lone window always goes to the weekly row. Codex reports whichever
+        // limit is in force as the primary window, and right now that is the 7 day
+        // one; anchoring it here means the value can never hop rows on its own.
+        (Some(window), None) | (None, Some(window)) => {
+            data.weekly = codex_section_from_window(&window);
+        }
+        // Both in force: sort them by window length, and keep the historical
+        // primary = 5h, secondary = 7d order whenever the lengths don't say
+        // otherwise.
+        (Some(primary), Some(secondary)) => {
+            let swap = codex_window_is_weekly(&primary).unwrap_or(false)
+                && !codex_window_is_weekly(&secondary).unwrap_or(true);
+            let (session, weekly) = if swap {
+                (secondary, primary)
+            } else {
+                (primary, secondary)
+            };
+            data.session = codex_section_from_window(&session);
+            data.weekly = codex_section_from_window(&weekly);
+        }
+        (None, None) => {}
     }
 
     Some(data)
@@ -913,37 +974,42 @@ fn fetch_antigravity_usage_from_endpoint(
 }
 
 fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<String>, PollError> {
-    let agent = build_agent()?;
     let body = serde_json::json!({
         "metadata": {
             "ideType": "ANTIGRAVITY"
         }
     });
 
-    let resp = match agent
-        .post(&format!("{base_url}/v1internal:loadCodeAssist"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/json")
-        .set("User-Agent", "antigravity")
+    let resp = match http::post(&format!("{base_url}/v1internal:loadCodeAssist"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "antigravity")
         .send_json(&body)
     {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "Antigravity loadCodeAssist returned auth error status {code}"
-            ));
-            return Err(PollError::AuthRequired);
-        }
         Err(error) => {
             diagnose::log_error("Antigravity loadCodeAssist request failed", error);
             return Err(PollError::RequestFailed);
         }
     };
 
-    let response: AntigravityLoadResponse = match resp.into_json() {
-        Ok(response) => response,
-        Err(error) => {
-            diagnose::log_error("unable to parse Antigravity loadCodeAssist response", error);
+    let code = resp.status();
+    if is_auth_error(code) {
+        diagnose::log(format!(
+            "Antigravity loadCodeAssist returned auth error status {code}"
+        ));
+        return Err(PollError::AuthRequired);
+    }
+
+    if !is_success(code) {
+        diagnose::log(format!("Antigravity loadCodeAssist returned status {code}"));
+        return Err(PollError::RequestFailed);
+    }
+
+    let response: AntigravityLoadResponse = match resp.json() {
+        Some(response) => response,
+        None => {
+            diagnose::log("unable to parse Antigravity loadCodeAssist response");
             return Err(PollError::RequestFailed);
         }
     };
@@ -956,39 +1022,43 @@ fn fetch_antigravity_model_quota(
     token: &str,
     project: Option<&str>,
 ) -> Result<UsageSection, PollError> {
-    let agent = build_agent()?;
     let body = match project {
         Some(project) => serde_json::json!({ "project": project }),
         None => serde_json::json!({}),
     };
 
-    let resp = match agent
-        .post(&format!("{base_url}/v1internal:fetchAvailableModels"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/json")
-        .set("User-Agent", "antigravity")
+    let resp = match http::post(&format!("{base_url}/v1internal:fetchAvailableModels"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "antigravity")
         .send_json(&body)
     {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "Antigravity fetchAvailableModels returned auth error status {code}"
-            ));
-            return Err(PollError::AuthRequired);
-        }
         Err(error) => {
             diagnose::log_error("Antigravity fetchAvailableModels request failed", error);
             return Err(PollError::RequestFailed);
         }
     };
 
-    let response: AntigravityModelsResponse = match resp.into_json() {
-        Ok(response) => response,
-        Err(error) => {
-            diagnose::log_error(
-                "unable to parse Antigravity fetchAvailableModels response",
-                error,
-            );
+    let code = resp.status();
+    if is_auth_error(code) {
+        diagnose::log(format!(
+            "Antigravity fetchAvailableModels returned auth error status {code}"
+        ));
+        return Err(PollError::AuthRequired);
+    }
+
+    if !is_success(code) {
+        diagnose::log(format!(
+            "Antigravity fetchAvailableModels returned status {code}"
+        ));
+        return Err(PollError::RequestFailed);
+    }
+
+    let response: AntigravityModelsResponse = match resp.json() {
+        Some(response) => response,
+        None => {
+            diagnose::log("unable to parse Antigravity fetchAvailableModels response");
             return Err(PollError::RequestFailed);
         }
     };
@@ -1008,33 +1078,37 @@ fn fetch_antigravity_quota_summary(
     token: &str,
     project: &str,
 ) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
     let body = serde_json::json!({ "project": project });
 
-    let resp = match agent
-        .post(&format!("{base_url}/v1internal:retrieveUserQuotaSummary"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/json")
-        .set("User-Agent", "antigravity")
+    let resp = match http::post(&format!("{base_url}/v1internal:retrieveUserQuotaSummary"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "antigravity")
         .send_json(&body)
     {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            return Err(PollError::AuthRequired);
-        }
         Err(error) => {
             diagnose::log_error("Antigravity retrieveUserQuotaSummary request failed", error);
             return Err(PollError::RequestFailed);
         }
     };
 
-    let response: AntigravityQuotaSummaryResponse = match resp.into_json() {
-        Ok(response) => response,
-        Err(error) => {
-            diagnose::log_error(
-                "unable to parse Antigravity retrieveUserQuotaSummary response",
-                error,
-            );
+    let code = resp.status();
+    if is_auth_error(code) {
+        return Err(PollError::AuthRequired);
+    }
+
+    if !is_success(code) {
+        diagnose::log(format!(
+            "Antigravity retrieveUserQuotaSummary returned status {code}"
+        ));
+        return Err(PollError::RequestFailed);
+    }
+
+    let response: AntigravityQuotaSummaryResponse = match resp.json() {
+        Some(response) => response,
+        None => {
+            diagnose::log("unable to parse Antigravity retrieveUserQuotaSummary response");
             return Err(PollError::RequestFailed);
         }
     };
@@ -1147,14 +1221,14 @@ fn is_antigravity_display_model(model: &str) -> bool {
         || model.starts_with("imagen")
 }
 
-fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
+fn get_header_f64(response: &http::Response, name: &str) -> f64 {
     response
         .header(name)
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0)
 }
 
-fn get_header_i64(response: &ureq::Response, name: &str) -> Option<i64> {
+fn get_header_i64(response: &http::Response, name: &str) -> Option<i64> {
     response.header(name).and_then(|s| s.parse::<i64>().ok())
 }
 
@@ -1229,7 +1303,7 @@ fn codex_auth_path() -> Option<PathBuf> {
         return Some(codex_home.join("auth.json"));
     }
 
-    Some(dirs::home_dir()?.join(".codex").join("auth.json"))
+    Some(home_dir()?.join(".codex").join("auth.json"))
 }
 
 fn read_codex_credentials() -> Option<CodexTokenData> {
@@ -1522,9 +1596,15 @@ fn is_leap(y: u64) -> bool {
 }
 
 /// Format a usage section as "X% · Yh" style text
-pub fn format_line(section: &UsageSection, strings: Strings) -> String {
+/// True when the provider did not report this window at all, as opposed to
+/// reporting it as unused: no reset time and no usage.
+pub fn section_is_unavailable(section: &UsageSection) -> bool {
+    section.resets_at.is_none() && section.percentage == 0.0
+}
+
+pub fn format_line(section: &UsageSection) -> String {
     let pct = format!("{:.0}%", section.percentage);
-    let cd = format_countdown(section.resets_at, strings);
+    let cd = format_countdown(section.resets_at);
     if cd.is_empty() {
         pct
     } else {
@@ -1532,7 +1612,7 @@ pub fn format_line(section: &UsageSection, strings: Strings) -> String {
     }
 }
 
-fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
+fn format_countdown(resets_at: Option<SystemTime>) -> String {
     let reset = match resets_at {
         Some(t) => t,
         None => return String::new(),
@@ -1540,10 +1620,10 @@ fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
 
     let remaining = match reset.duration_since(SystemTime::now()) {
         Ok(d) => d,
-        Err(_) => return strings.now.to_string(),
+        Err(_) => return strings::NOW.to_string(),
     };
 
-    format_countdown_from_secs(remaining.as_secs(), strings)
+    format_countdown_from_secs(remaining.as_secs())
 }
 
 /// Calculate how long until the display text would change
@@ -1553,19 +1633,29 @@ pub fn time_until_display_change(resets_at: Option<SystemTime>) -> Option<Durati
     Some(time_until_display_change_from_secs(remaining.as_secs()))
 }
 
-fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
+fn format_countdown_from_secs(total_secs: u64) -> String {
     let total_mins = total_secs / 60;
     let total_hours = total_secs / 3600;
     let total_days = total_secs / 86400;
 
     if total_days >= 1 {
-        format!("{total_days}{}", strings.day_suffix)
+        let hours = total_hours % 24;
+        format!(
+            "{total_days}{}{hours}{}",
+            strings::DAY_SUFFIX,
+            strings::HOUR_SUFFIX
+        )
     } else if total_hours >= 1 {
-        format!("{total_hours}{}", strings.hour_suffix)
+        let mins = total_mins % 60;
+        format!(
+            "{total_hours}{}{mins}{}",
+            strings::HOUR_SUFFIX,
+            strings::MINUTE_SUFFIX
+        )
     } else if total_mins >= 1 {
-        format!("{total_mins}{}", strings.minute_suffix)
+        format!("{total_mins}{}", strings::MINUTE_SUFFIX)
     } else {
-        format!("{total_secs}{}", strings.second_suffix)
+        format!("{total_secs}{}", strings::SECOND_SUFFIX)
     }
 }
 
@@ -1575,10 +1665,10 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
     let total_days = total_secs / 86400;
 
     let current_bucket_start = if total_days >= 1 {
-        total_days * 86400
-    } else if total_hours >= 1 {
+        // Text now carries hours alongside days, so it changes every hour.
         total_hours * 3600
     } else if total_mins >= 1 {
+        // Both the "Xh Ym" and "Xm" forms change once a minute.
         total_mins * 60
     } else {
         total_secs
@@ -1731,5 +1821,115 @@ mod tests {
         assert!((usage.session.percentage - 4.17425).abs() < 0.000001);
         assert!(usage.weekly.resets_at.is_some());
         assert!(usage.session.resets_at.is_some());
+    }
+
+    fn codex_usage(json: &str) -> UsageData {
+        let response: CodexUsageResponse =
+            serde_json::from_str(json).expect("usage response should deserialize");
+        codex_usage_from_response(response).expect("rate limit should be present")
+    }
+
+    #[test]
+    fn codex_lone_window_lands_in_the_weekly_row() {
+        // What the API returns once the 5h limit is retired: a single window,
+        // reported as "primary", covering 7 days.
+        let usage = codex_usage(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 19,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1786159990
+                    },
+                    "secondary_window": null
+                }
+            }"#,
+        );
+
+        assert_eq!(usage.weekly.percentage, 19.0);
+        assert!(usage.weekly.resets_at.is_some());
+        assert!(section_is_unavailable(&usage.session));
+    }
+
+    #[test]
+    fn codex_lone_window_stays_weekly_whatever_its_length() {
+        // Deliberate: a single window is pinned to the weekly row even if the API
+        // labels it short, so the figure never moves between rows by itself.
+        let usage = codex_usage(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 19,
+                        "limit_window_seconds": 18000,
+                        "reset_at": 1786159990
+                    },
+                    "secondary_window": null
+                }
+            }"#,
+        );
+
+        assert_eq!(usage.weekly.percentage, 19.0);
+        assert!(section_is_unavailable(&usage.session));
+    }
+
+    #[test]
+    fn codex_keeps_both_windows_in_their_own_rows() {
+        let usage = codex_usage(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 7,
+                        "limit_window_seconds": 18000,
+                        "reset_at": 1786159990
+                    },
+                    "secondary_window": {
+                        "used_percent": 42,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1786759990
+                    }
+                }
+            }"#,
+        );
+
+        assert_eq!(usage.session.percentage, 7.0);
+        assert_eq!(usage.weekly.percentage, 42.0);
+    }
+
+    #[test]
+    fn codex_swaps_both_windows_when_the_lengths_are_reversed() {
+        let usage = codex_usage(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 42,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1786759990
+                    },
+                    "secondary_window": {
+                        "used_percent": 7,
+                        "limit_window_seconds": 18000,
+                        "reset_at": 1786159990
+                    }
+                }
+            }"#,
+        );
+
+        assert_eq!(usage.session.percentage, 7.0);
+        assert_eq!(usage.weekly.percentage, 42.0);
+    }
+
+    #[test]
+    fn codex_without_window_lengths_keeps_the_primary_secondary_split() {
+        let usage = codex_usage(
+            r#"{
+                "rate_limit": {
+                    "primary_window": { "used_percent": 7, "reset_at": 1786159990 },
+                    "secondary_window": { "used_percent": 42, "reset_at": 1786759990 }
+                }
+            }"#,
+        );
+
+        assert_eq!(usage.session.percentage, 7.0);
+        assert_eq!(usage.weekly.percentage, 42.0);
     }
 }

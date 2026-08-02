@@ -1,32 +1,27 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
-use windows::Win32::System::Registry::*;
-use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
-use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
-use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
+use crate::strings;
 use crate::theme;
-use crate::tray_icon;
-use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
 #[derive(Clone, Copy)]
@@ -46,14 +41,7 @@ impl SendHwnd {
 /// Shared application state
 struct AppState {
     hwnd: SendHwnd,
-    taskbar_hwnd: Option<HWND>,
-    tray_notify_hwnd: Option<HWND>,
-    win_event_hook: Option<HWINEVENTHOOK>,
     is_dark: bool,
-    embedded: bool,
-    language_override: Option<LanguageId>,
-    language: LanguageId,
-    install_channel: InstallChannel,
 
     session_percent: f64,
     session_text: String,
@@ -80,26 +68,11 @@ struct AppState {
     auth_watch_mode: poller::CredentialWatchMode,
     auth_watch_snapshot: poller::CredentialWatchSnapshot,
     last_poll_ok: bool,
-    update_status: UpdateStatus,
-    last_update_check_unix: Option<u64>,
 
-    taskbar_index: usize,
-    tray_offset: i32,
-    dragging: bool,
-    drag_start_mouse_x: i32,
-    drag_start_client_x: i32,
-    drag_start_offset: i32,
-
-    widget_visible: bool,
-}
-
-#[derive(Clone, Debug)]
-enum UpdateStatus {
-    Idle,
-    Checking,
-    Applying,
-    UpToDate,
-    Available(ReleaseDescriptor),
+    /// Last known top-left screen position of the window, persisted so the app
+    /// reopens where the user left it.
+    window_x: Option<i32>,
+    window_y: Option<i32>,
 }
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
@@ -114,33 +87,11 @@ const IDM_FREQ_1MIN: u16 = 10;
 const IDM_FREQ_5MIN: u16 = 11;
 const IDM_FREQ_15MIN: u16 = 12;
 const IDM_FREQ_1HOUR: u16 = 13;
-const IDM_START_WITH_WINDOWS: u16 = 20;
-const IDM_RESET_POSITION: u16 = 30;
-const IDM_VERSION_ACTION: u16 = 31;
-const IDM_LANG_SYSTEM: u16 = 40;
-const IDM_LANG_ENGLISH: u16 = 41;
-const IDM_LANG_DUTCH: u16 = 42;
-const IDM_LANG_SPANISH: u16 = 43;
-const IDM_LANG_FRENCH: u16 = 44;
-const IDM_LANG_GERMAN: u16 = 45;
-const IDM_LANG_JAPANESE: u16 = 46;
-const IDM_LANG_KOREAN: u16 = 47;
-const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
-const IDM_LANG_RUSSIAN: u16 = 49;
-const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
-const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
-const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
-
-/// How often the watchdog thread polls for an explorer.exe restart (which
-/// recreates the taskbar and wipes our tray-icon registration).
-const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
-
-static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
@@ -165,93 +116,6 @@ fn refresh_dpi() {
             CURRENT_DPI.store(dpi, Ordering::Relaxed);
         }
     }
-}
-
-/// Spacing below which two relaunches are treated as a storm (e.g. explorer.exe
-/// crash-looping); when detected we back off instead of spawning in a tight loop.
-const RELAUNCH_THROTTLE_SECS: u64 = 10;
-const RELAUNCH_BACKOFF_SECS: u64 = 30;
-/// Environment flag set on a relaunched child so it waits for the previous
-/// instance's single-instance mutex instead of exiting immediately.
-const ENV_RELAUNCH: &str = "CCUM_RELAUNCH";
-/// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
-/// the child so it can detect a relaunch storm.
-const ENV_LAST_RELAUNCH_UNIX: &str = "CCUM_LAST_RELAUNCH_UNIX";
-
-/// Relaunch the widget as a fresh process after explorer.exe has restarted.
-///
-/// When the shell restarts it destroys our embedded child window outright (the
-/// window is gone, not merely orphaned - `IsWindow` returns false) and leaves
-/// the UI thread parked in `GetMessage` with no window to recreate in place.
-/// Spawning a clean new process - which re-embeds into the freshly created
-/// taskbar - and exiting this one is the robust recovery. The child is flagged
-/// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
-/// be released before taking over (see the guard in `run`).
-fn relaunch_self() {
-    // Back off if we are relaunching very soon after the relaunch that spawned
-    // us: that signals the shell is crash-looping, not a one-off restart.
-    let now = now_unix_secs();
-    let last = std::env::var(ENV_LAST_RELAUNCH_UNIX)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if last != 0 && now.saturating_sub(last) < RELAUNCH_THROTTLE_SECS {
-        diagnose::log("relaunch storm detected; backing off before relaunching");
-        std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            diagnose::log_error("watchdog: unable to resolve current executable", error);
-            return;
-        }
-    };
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(exe)
-        .args(&args)
-        .env(ENV_RELAUNCH, "1")
-        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
-        .spawn()
-    {
-        Ok(_) => {
-            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
-            std::process::exit(0);
-        }
-        Err(error) => {
-            diagnose::log_error("watchdog: unable to spawn relaunched instance", error);
-        }
-    }
-}
-
-/// Detect explorer.exe restarts and recover from them.
-///
-/// Once explorer destroys the taskbar, our embedded child window is destroyed
-/// and the UI message loop is dead, so recovery cannot happen in-process. This
-/// dedicated thread (independent of the dead message loop) polls the taskbar
-/// handle and, when it changes, relaunches the widget as a fresh process.
-fn spawn_taskbar_watchdog() {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
-        let stored = {
-            let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
-        };
-        // Only relevant once we have embedded into a taskbar at least once.
-        let Some(old) = stored else {
-            continue;
-        };
-        let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
-            let new = taskbars[0].hwnd;
-            diagnose::log(format!(
-                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
-                old.0, new.0
-            ));
-            relaunch_self();
-        }
-    });
 }
 
 fn load_embedded_app_icons() -> (HICON, HICON) {
@@ -298,18 +162,12 @@ fn settings_path() -> PathBuf {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SettingsFile {
-    #[serde(default)]
-    tray_offset: i32,
-    #[serde(default)]
-    taskbar_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_y: Option<i32>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_update_check_unix: Option<u64>,
-    #[serde(default = "default_widget_visible")]
-    widget_visible: bool,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
@@ -321,12 +179,9 @@ struct SettingsFile {
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
-            tray_offset: 0,
-            taskbar_index: 0,
+            window_x: None,
+            window_y: None,
             poll_interval_ms: default_poll_interval(),
-            language: None,
-            last_update_check_unix: None,
-            widget_visible: true,
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
@@ -336,10 +191,6 @@ impl Default for SettingsFile {
 
 fn default_poll_interval() -> u32 {
     POLL_15_MIN
-}
-
-fn default_widget_visible() -> bool {
-    true
 }
 
 fn default_show_claude_code() -> bool {
@@ -380,14 +231,9 @@ fn save_state_settings() {
     let state = lock_state();
     if let Some(s) = state.as_ref() {
         save_settings(&SettingsFile {
-            tray_offset: s.tray_offset,
-            taskbar_index: s.taskbar_index,
+            window_x: s.window_x,
+            window_y: s.window_y,
             poll_interval_ms: s.poll_interval_ms,
-            language: s
-                .language_override
-                .map(|language| language.code().to_string()),
-            last_update_check_unix: s.last_update_check_unix,
-            widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
@@ -395,242 +241,142 @@ fn save_state_settings() {
     }
 }
 
-fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
-    let state = lock_state();
-    match state.as_ref() {
-        Some(s) if s.last_poll_ok => {
-            let mut icons = Vec::new();
-            if s.show_claude_code {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: Some(s.session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().claude_code_model,
-                        s.session_text,
-                        s.weekly_text
-                    ),
-                });
-            }
-            if s.show_codex {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: Some(s.codex_session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().codex_model,
-                        s.codex_session_text,
-                        s.codex_weekly_text
-                    ),
-                });
-            }
-            if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: Some(s.antigravity_session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().antigravity_model,
-                        s.antigravity_session_text,
-                        s.antigravity_weekly_text
-                    ),
-                });
-            }
-            icons
-        }
-        Some(s) => {
-            let mut icons = Vec::new();
-            if s.show_claude_code {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: None,
-                    tooltip: s.language.strings().window_title.to_string(),
-                });
-            }
-            if s.show_codex {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: None,
-                    tooltip: s.language.strings().codex_window_title.to_string(),
-                });
-            }
-            if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: None,
-                    tooltip: s.language.strings().antigravity_window_title.to_string(),
-                });
-            }
-            icons
-        }
-        None => Vec::new(),
-    }
-}
+/// Style of the main window: an ordinary caption bar with minimise and close,
+/// but no resize grip - the content has a fixed size.
+const MAIN_WINDOW_STYLE: WINDOW_STYLE = WINDOW_STYLE(
+    WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0,
+);
 
-fn sync_tray_icons(hwnd: HWND) {
-    let icons = tray_icon_data_from_state();
-    tray_icon::sync(hwnd, &icons);
-}
-
-fn toggle_widget_visibility(hwnd: HWND) {
-    let new_visible = {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            s.widget_visible = !s.widget_visible;
-            s.widget_visible
-        } else {
-            return;
-        }
+/// Outer window size needed to host a client area of the given size.
+fn window_size_for_client(client_width: i32, client_height: i32) -> (i32, i32) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: client_width,
+        bottom: client_height,
     };
-    save_state_settings();
     unsafe {
-        if new_visible {
-            position_at_taskbar();
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            render_layered();
-        } else {
-            let _ = ShowWindow(hwnd, SW_HIDE);
+        let dpi = CURRENT_DPI.load(Ordering::Relaxed);
+        // `true` accounts for the single-row menu bar.
+        if AdjustWindowRectExForDpi(&mut rect, MAIN_WINDOW_STYLE, true, WINDOW_EX_STYLE(0), dpi)
+            .is_err()
+        {
+            let _ = AdjustWindowRectEx(&mut rect, MAIN_WINDOW_STYLE, true, WINDOW_EX_STYLE(0));
         }
     }
+    (rect.right - rect.left, rect.bottom - rect.top)
 }
 
-fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
-    let taskbars = native_interop::find_taskbars();
-    if taskbars.is_empty() {
-        diagnose::log("taskbar not found; using fallback popup window");
-        return false;
+/// Resize the window so the content fits exactly, keeping its position.
+fn resize_window_to_content(hwnd: HWND) {
+    let (width, height) = window_size_for_client(client_width(), client_height());
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            0,
+            0,
+            width,
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
-
-    let index = requested_index.min(taskbars.len().saturating_sub(1));
-    let taskbar = taskbars[index];
-    diagnose::log(format!(
-        "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
-        taskbars.len(),
-        taskbar.hwnd,
-        taskbar.rect.left,
-        taskbar.rect.top,
-        taskbar.rect.right,
-        taskbar.rect.bottom
-    ));
-
-    let old_hook = {
-        let mut state = lock_state();
-        state.as_mut().and_then(|s| s.win_event_hook.take())
-    };
-    if let Some(hook) = old_hook {
-        native_interop::unhook_win_event(hook);
-    }
-
-    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
-
-    let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
-    if tray_notify.is_some() {
-        diagnose::log("TrayNotifyWnd found");
-    } else {
-        diagnose::log("TrayNotifyWnd not found");
-    }
-
-    let hook = tray_notify.and_then(|tray_hwnd| {
-        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
-    });
-    if hook.is_some() {
-        diagnose::log("tray event hook installed");
-    } else {
-        diagnose::log("tray event hook could not be installed");
-    }
-
-    let mut state = lock_state();
-    if let Some(s) = state.as_mut() {
-        s.taskbar_hwnd = Some(taskbar.hwnd);
-        s.tray_notify_hwnd = tray_notify;
-        s.win_event_hook = hook;
-        s.taskbar_index = index;
-        s.embedded = true;
-    }
-    true
 }
 
-fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
-    native_interop::find_taskbars()
-        .into_iter()
-        .enumerate()
-        .find(|(_, taskbar)| {
-            pt.x >= taskbar.rect.left
-                && pt.x < taskbar.rect.right
-                && pt.y >= taskbar.rect.top
-                && pt.y < taskbar.rect.bottom
-        })
-}
-
-fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
-    let mut tray_left = taskbar_rect.right;
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
-    tray_left
-}
-
-fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let max_offset = (tray_left - taskbar_rect.left - total_widget_width()).max(0);
-    offset.clamp(0, max_offset)
-}
-
-fn offset_for_drop_point(
-    taskbar_hwnd: HWND,
-    taskbar_rect: RECT,
-    pt: POINT,
-    drag_start_client_x: i32,
-) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
-    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
-    clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn update_check_interval() -> Duration {
-    Duration::from_secs(24 * 60 * 60)
-}
-
-fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
-    let Some(last_update_check_unix) = last_update_check_unix else {
-        return true;
-    };
-
-    now_unix_secs().saturating_sub(last_update_check_unix) >= update_check_interval().as_secs()
-}
-
-fn schedule_auto_update_check(hwnd: HWND) {
-    let delay_ms = {
-        let state = lock_state();
-        let Some(s) = state.as_ref() else {
+/// Move the window to the centre of the monitor it currently sits on.
+fn center_window(hwnd: HWND) {
+    unsafe {
+        let mut window_rect = RECT::default();
+        if GetWindowRect(hwnd, &mut window_rect).is_err() {
             return;
+        }
+        let width = window_rect.right - window_rect.left;
+        let height = window_rect.bottom - window_rect.top;
+
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let work_area = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            info.rcWork
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
+            }
         };
 
-        if auto_update_check_due(s.last_update_check_unix) {
-            None
-        } else {
-            let elapsed = now_unix_secs().saturating_sub(s.last_update_check_unix.unwrap_or(0));
-            let remaining_secs = update_check_interval().as_secs().saturating_sub(elapsed);
-            Some((remaining_secs.saturating_mul(1000)).min(u32::MAX as u64) as u32)
-        }
-    };
+        let x = work_area.left + ((work_area.right - work_area.left) - width) / 2;
+        let y = work_area.top + ((work_area.bottom - work_area.top) - height) / 2;
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
 
+/// Clamp a stored position back onto a visible monitor, so a window saved on a
+/// screen that is no longer attached does not open off-screen.
+fn position_is_visible(x: i32, y: i32, width: i32, height: i32) -> bool {
+    let rect = RECT {
+        left: x,
+        top: y,
+        right: x + width,
+        bottom: y + height,
+    };
     unsafe {
-        let _ = KillTimer(hwnd, TIMER_UPDATE_CHECK);
-        if let Some(delay_ms) = delay_ms {
-            SetTimer(hwnd, TIMER_UPDATE_CHECK, delay_ms.max(1), None);
+        let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONULL);
+        !monitor.is_invalid()
+    }
+}
+
+/// Match the caption bar to the current Windows light/dark theme.
+fn apply_title_bar_theme(hwnd: HWND, is_dark: bool) {
+    unsafe {
+        let value = BOOL::from(is_dark);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &value as *const BOOL as *const std::ffi::c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        );
+    }
+}
+
+/// Record the current window position so it can be restored next launch.
+fn remember_window_position(hwnd: HWND) {
+    unsafe {
+        // Ignore minimised/maximised placements - they report bogus coordinates.
+        if IsIconic(hwnd).as_bool() {
+            return;
         }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return;
+        }
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.window_x = Some(rect.left);
+            s.window_y = Some(rect.top);
+        }
+    }
+}
+
+/// Usage text for a window a provider may not report at all - a missing window
+/// reads as "--" rather than a misleading "0%".
+fn format_section(section: &crate::models::UsageSection) -> String {
+    if poller::section_is_unavailable(section) {
+        "--".to_string()
+    } else {
+        poller::format_line(section)
     }
 }
 
@@ -639,49 +385,62 @@ fn refresh_usage_texts(state: &mut AppState) {
         return;
     }
 
-    let strings = state.language.strings();
     let Some(data) = state.data.as_ref() else {
         return;
     };
 
     if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(&claude_code.session, strings);
-        state.weekly_text = poller::format_line(&claude_code.weekly, strings);
+        state.session_text = poller::format_line(&claude_code.session);
+        state.weekly_text = poller::format_line(&claude_code.weekly);
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(&codex.session, strings);
-        state.codex_weekly_text = poller::format_line(&codex.weekly, strings);
+        state.codex_session_text = format_section(&codex.session);
+        state.codex_weekly_text = format_section(&codex.weekly);
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
     }
 
     if let Some(antigravity) = data.antigravity.as_ref() {
-        state.antigravity_session_text = poller::format_line(&antigravity.session, strings);
-        state.antigravity_weekly_text =
-            if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
-                "--".to_string()
-            } else {
-                poller::format_line(&antigravity.weekly, strings)
-            };
+        state.antigravity_session_text = poller::format_line(&antigravity.session);
+        state.antigravity_weekly_text = format_section(&antigravity.weekly);
     } else if state.show_antigravity {
         state.antigravity_session_text = "!".to_string();
         state.antigravity_weekly_text = "!".to_string();
     }
 }
 
-fn set_window_title(hwnd: HWND, strings: Strings) {
-    unsafe {
-        let title = native_interop::wide_str(strings.window_title);
-        let _ = SetWindowTextW(hwnd, PCWSTR::from_raw(title.as_ptr()));
+/// Caption text: name the single provider being shown, if there is only one.
+fn window_title_for(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+) -> &'static str {
+    match (show_claude_code, show_codex, show_antigravity) {
+        (false, true, false) => strings::CODEX_WINDOW_TITLE,
+        (false, false, true) => strings::ANTIGRAVITY_WINDOW_TITLE,
+        _ => strings::WINDOW_TITLE,
     }
 }
 
-fn show_info_message(hwnd: HWND, title: &str, message: &str) {
+fn set_window_title(state: &AppState) {
+    let text = window_title_for(
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
+    );
+    unsafe {
+        let title = native_interop::wide_str(text);
+        let _ = SetWindowTextW(state.hwnd.to_hwnd(), PCWSTR::from_raw(title.as_ptr()));
+    }
+}
+
+/// Warn the user that a provider needs to be signed in again.
+fn show_warning_message(hwnd: HWND, title: &str, message: &str) {
     unsafe {
         let title_wide = native_interop::wide_str(title);
         let message_wide = native_interop::wide_str(message);
@@ -689,357 +448,8 @@ fn show_info_message(hwnd: HWND, title: &str, message: &str) {
             hwnd,
             PCWSTR::from_raw(message_wide.as_ptr()),
             PCWSTR::from_raw(title_wide.as_ptr()),
-            MB_OK | MB_ICONINFORMATION,
+            MB_OK | MB_ICONWARNING,
         );
-    }
-}
-
-fn show_error_message(hwnd: HWND, title: &str, message: &str) {
-    unsafe {
-        let title_wide = native_interop::wide_str(title);
-        let message_wide = native_interop::wide_str(message);
-        let _ = MessageBoxW(
-            hwnd,
-            PCWSTR::from_raw(message_wide.as_ptr()),
-            PCWSTR::from_raw(title_wide.as_ptr()),
-            MB_OK | MB_ICONERROR,
-        );
-    }
-}
-
-fn show_update_prompt(hwnd: HWND, strings: Strings, release: &ReleaseDescriptor) -> bool {
-    let message = strings
-        .update_prompt_now
-        .replace("{version}", &release.latest_version);
-
-    unsafe {
-        let title_wide = native_interop::wide_str(strings.update_available);
-        let message_wide = native_interop::wide_str(&message);
-        MessageBoxW(
-            hwnd,
-            PCWSTR::from_raw(message_wide.as_ptr()),
-            PCWSTR::from_raw(title_wide.as_ptr()),
-            MB_YESNO | MB_ICONQUESTION,
-        ) == IDYES
-    }
-}
-
-fn apply_language_to_state(state: &mut AppState, language_override: Option<LanguageId>) {
-    state.language_override = language_override;
-    state.language = localization::resolve_language(language_override);
-    set_window_title(state.hwnd.to_hwnd(), state.language.strings());
-    refresh_usage_texts(state);
-}
-
-fn update_language_change() -> bool {
-    let mut state = lock_state();
-    let Some(app_state) = state.as_mut() else {
-        return false;
-    };
-
-    if app_state.language_override.is_some() {
-        return false;
-    }
-
-    let new_language = localization::detect_system_language();
-    if new_language == app_state.language {
-        return false;
-    }
-
-    apply_language_to_state(app_state, None);
-    true
-}
-
-fn version_action_label(
-    strings: Strings,
-    language: LanguageId,
-    install_channel: InstallChannel,
-    status: &UpdateStatus,
-) -> String {
-    let current = env!("CARGO_PKG_VERSION");
-    match status {
-        UpdateStatus::Idle => format!("v{current} - {}", strings.check_for_updates),
-        UpdateStatus::Checking => format!("v{current} - {}", strings.checking_for_updates),
-        UpdateStatus::Applying => format!("v{current} - {}", strings.applying_update),
-        UpdateStatus::UpToDate => format!("v{current} - {}", strings.up_to_date_short),
-        UpdateStatus::Available(release) => match install_channel {
-            InstallChannel::Portable => {
-                format!(
-                    "v{current} - {} v{}",
-                    strings.update_to, release.latest_version
-                )
-            }
-            InstallChannel::Winget => format!(
-                "v{current} - {} v{}",
-                localization::update_via_winget(language),
-                release.latest_version
-            ),
-        },
-    }
-}
-
-fn begin_update_check(hwnd: HWND, interactive: bool) {
-    let send_hwnd = SendHwnd::from_hwnd(hwnd);
-    let (strings, install_channel) = {
-        let mut state = lock_state();
-        let Some(app_state) = state.as_mut() else {
-            return;
-        };
-
-        if matches!(
-            app_state.update_status,
-            UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            if interactive {
-                show_info_message(
-                    hwnd,
-                    app_state.language.strings().updates,
-                    app_state.language.strings().update_in_progress,
-                );
-            }
-            return;
-        }
-
-        app_state.update_status = UpdateStatus::Checking;
-        (app_state.language.strings(), app_state.install_channel)
-    };
-
-    std::thread::spawn(move || {
-        let hwnd = send_hwnd.to_hwnd();
-        let checked_at = now_unix_secs();
-        match updater::check_for_updates() {
-            Ok(UpdateCheckResult::UpToDate) => {
-                {
-                    let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        s.update_status = UpdateStatus::UpToDate;
-                        s.last_update_check_unix = Some(checked_at);
-                    }
-                }
-                save_state_settings();
-                if interactive {
-                    show_info_message(hwnd, strings.updates, strings.up_to_date);
-                }
-                unsafe {
-                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
-                }
-            }
-            Ok(UpdateCheckResult::Available(release)) => {
-                {
-                    let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        s.update_status = UpdateStatus::Available(release.clone());
-                        s.last_update_check_unix = Some(checked_at);
-                    }
-                }
-                save_state_settings();
-                if interactive && show_update_prompt(hwnd, strings, &release) {
-                    match install_channel {
-                        InstallChannel::Portable => begin_update_apply(hwnd, release),
-                        InstallChannel::Winget => begin_winget_update(hwnd),
-                    }
-                }
-                unsafe {
-                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
-                }
-            }
-            Err(error) => {
-                {
-                    let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        s.update_status = UpdateStatus::Idle;
-                        s.last_update_check_unix = Some(checked_at);
-                    }
-                }
-                save_state_settings();
-                if interactive {
-                    let message = format!("{}.\n\n{}", strings.update_failed, error);
-                    show_error_message(hwnd, strings.updates, &message);
-                }
-                unsafe {
-                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
-                }
-            }
-        }
-    });
-}
-
-fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
-    let send_hwnd = SendHwnd::from_hwnd(hwnd);
-    let strings = {
-        let mut state = lock_state();
-        let Some(app_state) = state.as_mut() else {
-            return;
-        };
-
-        if matches!(
-            app_state.update_status,
-            UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            show_info_message(
-                hwnd,
-                app_state.language.strings().updates,
-                app_state.language.strings().update_in_progress,
-            );
-            return;
-        }
-
-        app_state.update_status = UpdateStatus::Applying;
-        app_state.language.strings()
-    };
-
-    std::thread::spawn(move || {
-        let hwnd = send_hwnd.to_hwnd();
-        match updater::begin_self_update(&release) {
-            Ok(()) => unsafe {
-                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-            },
-            Err(error) => {
-                {
-                    let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        s.update_status = UpdateStatus::Available(release);
-                    }
-                }
-                let message = format!("{}.\n\n{}", strings.update_failed, error);
-                show_error_message(hwnd, strings.updates, &message);
-                unsafe {
-                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
-                }
-            }
-        }
-    });
-}
-
-fn begin_winget_update(hwnd: HWND) {
-    let strings = {
-        let state = lock_state();
-        state.as_ref().map(|s| s.language.strings())
-    }
-    .unwrap_or(LanguageId::English.strings());
-
-    match updater::begin_winget_update() {
-        Ok(()) => unsafe {
-            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-        },
-        Err(error) => {
-            let message = format!("{}.\n\n{}", strings.update_failed, error);
-            show_error_message(hwnd, strings.updates, &message);
-        }
-    }
-}
-
-const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
-
-/// Returns true only if the startup registry value points to this executable.
-fn is_startup_enabled() -> bool {
-    unsafe {
-        let path = native_interop::wide_str(STARTUP_REGISTRY_PATH);
-        let key_name = native_interop::wide_str(STARTUP_REGISTRY_KEY);
-
-        let mut hkey = HKEY::default();
-        let result = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR::from_raw(path.as_ptr()),
-            0,
-            KEY_READ,
-            &mut hkey,
-        );
-        if result.is_err() {
-            return false;
-        }
-
-        // Query the size of the value
-        let mut data_size: u32 = 0;
-        let result = RegQueryValueExW(
-            hkey,
-            PCWSTR::from_raw(key_name.as_ptr()),
-            None,
-            None,
-            None,
-            Some(&mut data_size),
-        );
-        if result.is_err() || data_size == 0 {
-            let _ = RegCloseKey(hkey);
-            return false;
-        }
-
-        // Read the value
-        let mut buf = vec![0u8; data_size as usize];
-        let result = RegQueryValueExW(
-            hkey,
-            PCWSTR::from_raw(key_name.as_ptr()),
-            None,
-            None,
-            Some(buf.as_mut_ptr()),
-            Some(&mut data_size),
-        );
-        let _ = RegCloseKey(hkey);
-        if result.is_err() {
-            return false;
-        }
-
-        // Convert the registry value (UTF-16) to a string
-        let wide_slice =
-            std::slice::from_raw_parts(buf.as_ptr() as *const u16, data_size as usize / 2);
-        let reg_value = String::from_utf16_lossy(wide_slice)
-            .trim_end_matches('\0')
-            .to_string();
-
-        // Get the current executable path
-        let mut exe_buf = [0u16; 260];
-        let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
-        if len == 0 {
-            return false;
-        }
-        let current_exe = String::from_utf16_lossy(&exe_buf[..len]);
-
-        // Case-insensitive comparison (Windows paths are case-insensitive)
-        reg_value.eq_ignore_ascii_case(&current_exe)
-    }
-}
-
-fn set_startup_enabled(enable: bool) {
-    unsafe {
-        let path = native_interop::wide_str(STARTUP_REGISTRY_PATH);
-
-        let mut hkey = HKEY::default();
-        let result = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR::from_raw(path.as_ptr()),
-            0,
-            KEY_SET_VALUE,
-            &mut hkey,
-        );
-        if result.is_err() {
-            return;
-        }
-
-        let key_name = native_interop::wide_str(STARTUP_REGISTRY_KEY);
-
-        if enable {
-            let mut exe_buf = [0u16; 260];
-            let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
-            if len > 0 {
-                // Write the wide string including null terminator
-                let byte_len = ((len + 1) * 2) as u32;
-                let _ = RegSetValueExW(
-                    hkey,
-                    PCWSTR::from_raw(key_name.as_ptr()),
-                    0,
-                    REG_SZ,
-                    Some(std::slice::from_raw_parts(
-                        exe_buf.as_ptr() as *const u8,
-                        byte_len as usize,
-                    )),
-                );
-            }
-        } else {
-            let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(key_name.as_ptr()));
-        }
-
-        let _ = RegCloseKey(hkey);
     }
 }
 
@@ -1050,33 +460,35 @@ const SEGMENT_GAP: i32 = 1;
 const SEGMENT_COUNT: i32 = 10;
 const CORNER_RADIUS: i32 = 2;
 
-const LEFT_DIVIDER_W: i32 = 3;
-const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
-const MODEL_RIGHT_MARGIN: i32 = 3;
-const RIGHT_MARGIN: i32 = 1;
-const WIDGET_HEIGHT: i32 = 46;
+/// Wide enough for the longest countdown line, "100% · 23h59m".
+const TEXT_WIDTH: i32 = 86;
+const MODEL_RIGHT_MARGIN: i32 = 14;
 
-fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
-    let divider_h = sc(25);
-    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
-    client_x >= 0
-        && client_x < sc(LEFT_DIVIDER_W)
-        && client_y >= divider_top
-        && client_y < divider_top + divider_h
+/// Padding between the window edges and the content.
+const CONTENT_PADDING_X: i32 = 16;
+const CONTENT_PADDING_Y: i32 = 14;
+/// Vertical gap between the 5h row and the 7d row.
+const ROW_GAP: i32 = 12;
+/// Keep the window wide enough for the caption text and the menu bar, even when
+/// a single model makes the content itself narrower than that.
+const MIN_CLIENT_WIDTH: i32 = 330;
+
+/// Client height needed for both rows plus padding, at the current DPI.
+fn client_height() -> i32 {
+    sc(CONTENT_PADDING_Y) * 2 + sc(SEGMENT_H) * 2 + sc(ROW_GAP)
 }
 
-fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
-    unsafe {
-        let mut pt = POINT::default();
-        if GetCursorPos(&mut pt).is_err() || !ScreenToClient(hwnd, &mut pt).as_bool() {
-            return false;
-        }
-        is_drag_handle_point(pt.x, pt.y)
-    }
+/// Client width at the current DPI: the content, or the minimum if wider.
+fn client_width() -> i32 {
+    content_width().max(sc(MIN_CLIENT_WIDTH))
+}
+
+/// Width of the drawn content itself, without the outer padding.
+fn content_inner_width() -> i32 {
+    content_width() - sc(CONTENT_PADDING_X) * 2
 }
 
 fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
@@ -1091,30 +503,20 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
-fn total_widget_width_for(active_models: i32) -> i32 {
+fn content_width_for(active_models: i32) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
     let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
         + sc(TEXT_WIDTH);
 
-    sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
+    sc(CONTENT_PADDING_X) * 2
         + sc(LABEL_WIDTH)
         + sc(LABEL_RIGHT_MARGIN)
         + model_width * active_models
         + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-        + sc(RIGHT_MARGIN)
 }
 
-fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-    ))
-}
-
-fn total_widget_width() -> i32 {
+fn content_width() -> i32 {
     let active_models = {
         let state = lock_state();
         state
@@ -1122,7 +524,7 @@ fn total_widget_width() -> i32 {
             .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
             .unwrap_or(1)
     };
-    total_widget_width_for(active_models)
+    content_width_for(active_models)
 }
 
 fn claude_accent_color() -> Color {
@@ -1173,29 +575,18 @@ pub fn run() {
     }
     diagnose::log("window::run started");
 
-    // Single-instance guard: silently exit if another instance is running.
-    // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
-    // wait for the previous instance to release the mutex, then take over.
-    let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
+    let class_name = native_interop::wide_str("ClaudeCodeUsageMonitor");
+
+    // Single-instance guard: bring the running instance to the front and exit.
     let mutex_name = native_interop::wide_str("Global\\ClaudeCodeUsageMonitor");
     let _mutex = unsafe {
         let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
             Ok(h) => {
                 if GetLastError() == ERROR_ALREADY_EXISTS {
-                    if is_relaunch {
-                        diagnose::log("relaunch: waiting for previous instance to exit");
-                        let wait_result = WaitForSingleObject(h, 10_000);
-                        if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
-                            diagnose::log(format!(
-                                "startup aborted: previous instance did not exit cleanly ({wait_result:?})"
-                            ));
-                            return;
-                        }
-                    } else {
-                        diagnose::log("startup aborted: another instance is already running");
-                        return;
-                    }
+                    diagnose::log("startup aborted: another instance is already running");
+                    activate_running_instance(&class_name);
+                    return;
                 }
                 h
             }
@@ -1208,8 +599,6 @@ pub fn run() {
             }
         }
     };
-
-    let class_name = native_interop::wide_str("ClaudeCodeUsageMonitor");
 
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
@@ -1234,26 +623,40 @@ pub fn run() {
         }
 
         let settings = load_settings();
-        let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
-        let language = localization::resolve_language(language_override);
-        let install_channel = updater::current_install_channel();
 
-        // Create as layered popup (will be reparented into taskbar)
-        let title = native_interop::wide_str(language.strings().window_title);
+        let title = native_interop::wide_str(window_title_for(
+            settings.show_claude_code,
+            settings.show_codex,
+            settings.show_antigravity,
+        ));
         let initial_model_count = active_model_count(
             settings.show_claude_code,
             settings.show_codex,
             settings.show_antigravity,
         );
+        let (window_width, window_height) = window_size_for_client(
+            content_width_for(initial_model_count).max(sc(MIN_CLIENT_WIDTH)),
+            client_height(),
+        );
+        let restored_position = match (settings.window_x, settings.window_y) {
+            (Some(x), Some(y)) if position_is_visible(x, y, window_width, window_height) => {
+                Some((x, y))
+            }
+            _ => None,
+        };
+        // Never pass CW_USEDEFAULT: the first ShowWindow of such a window lets
+        // the shell's STARTUPINFO override wherever we placed it afterwards.
+        let (start_x, start_y) = restored_position.unwrap_or((0, 0));
+
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            WINDOW_EX_STYLE(0),
             PCWSTR::from_raw(class_name.as_ptr()),
             PCWSTR::from_raw(title.as_ptr()),
-            WS_POPUP,
-            0,
-            0,
-            total_widget_width_for(initial_model_count),
-            sc(WIDGET_HEIGHT),
+            MAIN_WINDOW_STYLE,
+            start_x,
+            start_y,
+            window_width,
+            window_height,
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -1281,20 +684,12 @@ pub fn run() {
         diagnose::log(format!("main window created hwnd={:?}", hwnd));
 
         let is_dark = theme::is_dark_mode();
-        let mut embedded = false;
 
         {
             let mut state = lock_state();
             *state = Some(AppState {
                 hwnd: SendHwnd::from_hwnd(hwnd),
-                taskbar_hwnd: None,
-                tray_notify_hwnd: None,
-                win_event_hook: None,
                 is_dark,
-                embedded: false,
-                language_override,
-                language,
-                install_channel,
                 session_percent: 0.0,
                 session_text: "--".to_string(),
                 weekly_percent: 0.0,
@@ -1318,49 +713,28 @@ pub fn run() {
                 auth_watch_mode: poller::CredentialWatchMode::ActiveSource,
                 auth_watch_snapshot: Vec::new(),
                 last_poll_ok: false,
-                update_status: UpdateStatus::Idle,
-                last_update_check_unix: settings.last_update_check_unix,
-                taskbar_index: settings.taskbar_index,
-                tray_offset: settings.tray_offset,
-                dragging: false,
-                drag_start_mouse_x: 0,
-                drag_start_client_x: 0,
-                drag_start_offset: 0,
-                widget_visible: settings.widget_visible,
+                window_x: settings.window_x,
+                window_y: settings.window_y,
             });
         }
 
-        // Try to embed in taskbar
-        if attach_to_taskbar(hwnd, settings.taskbar_index) {
-            embedded = true;
-        }
+        refresh_menu_bar(hwnd);
 
-        // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
-        if !embedded {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+        // The window may have landed on a monitor with a different scale factor
+        // than the one we sized it for, so re-measure before showing it.
+        refresh_dpi();
+        resize_window_to_content(hwnd);
+        apply_title_bar_theme(hwnd, is_dark);
+        if restored_position.is_none() {
+            center_window(hwnd);
         }
+        remember_window_position(hwnd);
 
-        // Register system tray icon(s)
-        sync_tray_icons(hwnd);
-
-        // Position and show (only if widget_visible preference is true)
-        position_at_taskbar();
-        if settings.widget_visible {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        }
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
         diagnose::log("window shown");
 
-        // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
-        render_layered();
+        repaint();
 
         // Poll timer: 15 minutes
         let initial_poll_ms = {
@@ -1372,31 +746,12 @@ pub fn run() {
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
 
-        // Watch for explorer.exe restarts so we can re-embed and re-add the tray
-        // icon (the shell discards tray registrations when it restarts). This
-        // runs on a dedicated thread, NOT a window timer: once explorer destroys
-        // the taskbar, our embedded child window stops receiving all messages
-        // (WM_TIMER included), so a timer would never fire again.
-        spawn_taskbar_watchdog();
-
         // Initial poll
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
         std::thread::spawn(move || {
             diagnose::log("initial poll thread started");
             do_poll(send_hwnd);
         });
-
-        schedule_auto_update_check(hwnd);
-        let should_check_updates = {
-            let state = lock_state();
-            state
-                .as_ref()
-                .map(|s| auto_update_check_due(s.last_update_check_unix))
-                .unwrap_or(false)
-        };
-        if should_check_updates {
-            begin_update_check(hwnd, false);
-        }
 
         // Initial theme check
         check_theme_change();
@@ -1410,200 +765,39 @@ pub fn run() {
     }
 }
 
-/// Render widget content and push to the layered window via UpdateLayeredWindow.
-/// Renders fully opaque with the actual taskbar background colour so that
-/// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
-fn render_layered() {
+/// Invalidate the window so the content is redrawn from the current state.
+fn repaint() {
     refresh_dpi();
-    let (
-        hwnd_val,
-        is_dark,
-        embedded,
-        strings,
-        session_pct,
-        session_text,
-        weekly_pct,
-        weekly_text,
-        codex_session_pct,
-        codex_session_text,
-        codex_weekly_pct,
-        codex_weekly_text,
-        antigravity_session_pct,
-        antigravity_session_text,
-        antigravity_weekly_pct,
-        antigravity_weekly_text,
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-    ) = {
+    let hwnd = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.hwnd,
-                s.is_dark,
-                s.embedded,
-                s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
-                s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
-                s.antigravity_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
-            ),
+            Some(s) => s.hwnd.to_hwnd(),
             None => return,
         }
     };
-
-    let hwnd = hwnd_val.to_hwnd();
-
-    // For non-embedded fallback, just invalidate and let WM_PAINT handle it
-    if !embedded {
-        unsafe {
-            let _ = InvalidateRect(hwnd, None, false);
-        }
-        return;
-    }
-
-    let width = total_widget_width();
-    let height = sc(WIDGET_HEIGHT);
-
-    let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
-    let antigravity_accent = antigravity_accent_color();
-    let track = if is_dark {
-        Color::from_hex("#444444")
-    } else {
-        Color::from_hex("#AAAAAA")
-    };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_color = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
-    };
-
     unsafe {
-        let screen_dc = GetDC(hwnd);
-
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width,
-                biHeight: -height, // top-down
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: 0, // BI_RGB
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mem_dc = CreateCompatibleDC(screen_dc);
-        let dib =
-            CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
-
-        if dib.is_invalid() || bits.is_null() {
-            let _ = DeleteDC(mem_dc);
-            ReleaseDC(hwnd, screen_dc);
-            return;
-        }
-
-        let old_bmp = SelectObject(mem_dc, dib);
-        let pixel_count = (width * height) as usize;
-
-        // Render once with the actual taskbar background colour.
-        // Using an opaque background lets us use CLEARTYPE_QUALITY for
-        // sub-pixel font rendering that matches the rest of the OS.
-        paint_content(
-            mem_dc,
-            width,
-            height,
-            is_dark,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
-            strings,
-            session_pct,
-            &session_text,
-            weekly_pct,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            &codex_accent,
-            &antigravity_accent,
-        );
-
-        // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
-        // Content pixels → fully opaque (preserves ClearType sub-pixel rendering).
-        let bg_bgr = bg_color.to_colorref();
-        let pixel_data = std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count);
-        for px in pixel_data.iter_mut() {
-            let rgb = *px & 0x00FFFFFF;
-            if rgb == bg_bgr {
-                *px = 0x01000000;
-            } else {
-                *px = rgb | 0xFF000000;
-            }
-        }
-
-        // Push to window via UpdateLayeredWindow
-        let pt_src = POINT { x: 0, y: 0 };
-        let sz = SIZE {
-            cx: width,
-            cy: height,
-        };
-        let blend = BLENDFUNCTION {
-            BlendOp: 0, // AC_SRC_OVER
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: 1, // AC_SRC_ALPHA
-        };
-
-        let _ = UpdateLayeredWindow(
-            hwnd,
-            screen_dc,
-            None,
-            Some(&sz),
-            mem_dc,
-            Some(&pt_src),
-            COLORREF(0),
-            Some(&blend),
-            ULW_ALPHA,
-        );
-
-        // Cleanup
-        SelectObject(mem_dc, old_bmp);
-        let _ = DeleteObject(dib);
-        let _ = DeleteDC(mem_dc);
-        ReleaseDC(hwnd, screen_dc);
+        let _ = InvalidateRect(hwnd, None, false);
     }
 }
 
-/// Paint all widget content onto a DC with a given background color.
+/// Bring the window of an already-running instance to the foreground.
+fn activate_running_instance(class_name: &[u16]) {
+    unsafe {
+        let Ok(existing) = FindWindowW(PCWSTR::from_raw(class_name.as_ptr()), PCWSTR::null())
+        else {
+            return;
+        };
+        if existing.is_invalid() {
+            return;
+        }
+        if IsIconic(existing).as_bool() {
+            let _ = ShowWindow(existing, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(existing);
+    }
+}
+
+/// Paint the usage rows onto a DC with a given background color.
 fn paint_content(
     hdc: HDC,
     width: i32,
@@ -1613,7 +807,6 @@ fn paint_content(
     text_color: &Color,
     accent: &Color,
     track: &Color,
-    strings: Strings,
     session_pct: f64,
     session_text: &str,
     weekly_pct: f64,
@@ -1644,46 +837,12 @@ fn paint_content(
         FillRect(hdc, &client_rect, bg_brush);
         let _ = DeleteObject(bg_brush);
 
-        // Left divider
-        let divider_h = sc(25);
-        let divider_top = (height - divider_h) / 2;
-        let divider_bottom = divider_top + divider_h;
-
-        let (div_left, div_right) = if is_dark {
-            ((80, 80, 80), (40, 40, 40))
-        } else {
-            ((160, 160, 160), (230, 230, 230))
-        };
-
-        let left_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
-            div_left.0, div_left.1, div_left.2,
-        )));
-        let left_rect = RECT {
-            left: 0,
-            top: divider_top,
-            right: sc(2),
-            bottom: divider_bottom,
-        };
-        FillRect(hdc, &left_rect, left_brush);
-        let _ = DeleteObject(left_brush);
-
-        let right_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
-            div_right.0,
-            div_right.1,
-            div_right.2,
-        )));
-        let right_rect = RECT {
-            left: sc(2),
-            top: divider_top,
-            right: sc(3),
-            bottom: divider_bottom,
-        };
-        FillRect(hdc, &right_rect, right_brush);
-        let _ = DeleteObject(right_brush);
-
-        let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row2_y = height - sc(5) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
+        // Centre the content so it stays balanced when the window is wider than
+        // the content needs, or a pixel or two taller than we asked for.
+        let content_h = sc(SEGMENT_H) * 2 + sc(ROW_GAP);
+        let content_x = ((width - content_inner_width()) / 2).max(sc(CONTENT_PADDING_X));
+        let row1_y = ((height - content_h) / 2).max(sc(CONTENT_PADDING_Y));
+        let row2_y = row1_y + sc(SEGMENT_H) + sc(ROW_GAP);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -1713,7 +872,7 @@ fn paint_content(
             row1_y,
             is_dark,
             text_color,
-            strings.session_window,
+            strings::SESSION_WINDOW,
             session_pct,
             session_text,
             codex_session_pct,
@@ -1734,7 +893,7 @@ fn paint_content(
             row2_y,
             is_dark,
             text_color,
-            strings.weekly_window,
+            strings::WEEKLY_WINDOW,
             weekly_pct,
             weekly_text,
             codex_weekly_pct,
@@ -1897,35 +1056,26 @@ fn do_poll(send_hwnd: SendHwnd) {
             };
 
             if notify_auth_error {
-                let balloon = {
+                let alert = {
                     let state = lock_state();
                     state.as_ref().map(|s| {
                         if s.show_claude_code {
-                            (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Claude,
-                                s.language.strings().token_expired_title,
-                                s.language.strings().token_expired_body,
-                            )
+                            (strings::TOKEN_EXPIRED_TITLE, strings::TOKEN_EXPIRED_BODY)
                         } else if s.show_codex {
                             (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Codex,
-                                s.language.strings().codex_token_expired_title,
-                                s.language.strings().codex_token_expired_body,
+                                strings::CODEX_TOKEN_EXPIRED_TITLE,
+                                strings::CODEX_TOKEN_EXPIRED_BODY,
                             )
                         } else {
                             (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Antigravity,
-                                s.language.strings().antigravity_token_expired_title,
-                                s.language.strings().antigravity_token_expired_body,
+                                strings::ANTIGRAVITY_TOKEN_EXPIRED_TITLE,
+                                strings::ANTIGRAVITY_TOKEN_EXPIRED_BODY,
                             )
                         }
                     })
                 };
-                if let Some((_strings, kind, title, body)) = balloon {
-                    tray_icon::notify_balloon(hwnd, kind, title, body);
+                if let Some((title, body)) = alert {
+                    show_warning_message(hwnd, title, body);
                 }
             }
 
@@ -1998,27 +1148,19 @@ fn schedule_countdown_timer() {
 
 fn check_theme_change() {
     let new_dark = theme::is_dark_mode();
-    let changed = {
+    let hwnd = {
         let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            if s.is_dark != new_dark {
+        match state.as_mut() {
+            Some(s) if s.is_dark != new_dark => {
                 s.is_dark = new_dark;
-                true
-            } else {
-                false
+                Some(s.hwnd.to_hwnd())
             }
-        } else {
-            false
+            _ => None,
         }
     };
-    if changed {
-        render_layered();
-    }
-}
-
-fn check_language_change() {
-    if update_language_change() {
-        render_layered();
+    if let Some(hwnd) = hwnd {
+        apply_title_bar_theme(hwnd, new_dark);
+        repaint();
     }
 }
 
@@ -2037,166 +1179,6 @@ fn update_display() {
     refresh_usage_texts(s);
 }
 
-fn suppress_tray_reposition_for(duration: Duration) {
-    let mut until = SUPPRESS_TRAY_REPOSITION_UNTIL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    *until = Some(Instant::now() + duration);
-}
-
-fn tray_reposition_is_suppressed() -> bool {
-    let now = Instant::now();
-    let mut until = SUPPRESS_TRAY_REPOSITION_UNTIL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-
-    match *until {
-        Some(deadline) if now < deadline => true,
-        Some(_) => {
-            *until = None;
-            false
-        }
-        None => false,
-    }
-}
-
-fn position_at_taskbar() {
-    refresh_dpi();
-    // Drop the app-state lock before any Win32 call that may synchronously
-    // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, taskbar_hwnd) = {
-        let state = lock_state();
-        let s = match state.as_ref() {
-            Some(s) => s,
-            None => return,
-        };
-
-        // Don't fight the user's drag
-        if s.dragging {
-            return;
-        }
-
-        let taskbar_hwnd = match s.taskbar_hwnd {
-            Some(h) => h,
-            None => {
-                diagnose::log("position_at_taskbar skipped: no taskbar handle");
-                return;
-            }
-        };
-
-        (s.hwnd.to_hwnd(), s.embedded, s.tray_offset, taskbar_hwnd)
-    };
-
-    let taskbar_rect = match native_interop::get_taskbar_rect(taskbar_hwnd) {
-        Some(r) => r,
-        None => {
-            diagnose::log("position_at_taskbar skipped: unable to query taskbar rect");
-            return;
-        }
-    };
-
-    let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-    let mut tray_left = taskbar_rect.right;
-    let anchor_top = taskbar_rect.top;
-    let anchor_height = taskbar_height;
-
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
-
-    let widget_width = total_widget_width();
-    let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-    let tray_offset = tray_offset.clamp(0, max_offset);
-    let offset_changed = {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            if s.tray_offset != tray_offset {
-                s.tray_offset = tray_offset;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    };
-    if offset_changed {
-        save_state_settings();
-    }
-
-    let widget_height = sc(WIDGET_HEIGHT);
-    let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-    if embedded {
-        // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
-            y - taskbar_rect.top
-        ));
-    } else {
-        // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
-        ));
-    }
-}
-
-fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
-    let anchor_bottom = anchor_top + anchor_height;
-    (anchor_bottom - widget_height).max(anchor_top)
-}
-
-/// WinEvent callback for tray icon location changes
-unsafe extern "system" fn on_tray_location_changed(
-    _hook: HWINEVENTHOOK,
-    _event: u32,
-    hwnd: HWND,
-    _id_object: i32,
-    _id_child: i32,
-    _thread: u32,
-    _time: u32,
-) {
-    static LAST_REPOSITION: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-
-    let is_tray = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .and_then(|s| s.tray_notify_hwnd)
-            .map(|h| h == hwnd)
-            .unwrap_or(false)
-    };
-
-    if is_tray {
-        if tray_reposition_is_suppressed() {
-            return;
-        }
-
-        let should_reposition = {
-            let mut last = LAST_REPOSITION.lock().unwrap_or_else(|e| e.into_inner());
-            let now = std::time::Instant::now();
-            if last
-                .map(|t| now.duration_since(t).as_millis() > 500)
-                .unwrap_or(true)
-            {
-                *last = Some(now);
-                true
-            } else {
-                false
-            }
-        };
-        if should_reposition {
-            position_at_taskbar();
-            render_layered();
-        }
-    }
-}
-
 /// Main window procedure
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
@@ -2206,37 +1188,43 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_PAINT => {
-            // For non-embedded fallback, paint normally
-            let embedded = {
-                let state = lock_state();
-                state.as_ref().map(|s| s.embedded).unwrap_or(false)
-            };
-            if embedded {
-                // Layered windows don't use WM_PAINT; just validate the region
-                let mut ps = PAINTSTRUCT::default();
-                let _ = BeginPaint(hwnd, &mut ps);
-                let _ = EndPaint(hwnd, &ps);
-            } else {
-                let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                paint(hdc, hwnd);
-                let _ = EndPaint(hwnd, &ps);
-            }
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            paint(hdc, hwnd);
+            let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
-        WM_DISPLAYCHANGE | WM_DPICHANGED_MSG | WM_SETTINGCHANGE => {
-            if msg == WM_DPICHANGED_MSG {
-                let new_dpi = (wparam.0 & 0xFFFF) as u32;
-                CURRENT_DPI.store(new_dpi, Ordering::Relaxed);
-            }
+        WM_MOVE => {
+            remember_window_position(hwnd);
+            LRESULT(0)
+        }
+        WM_DPICHANGED_MSG => {
+            let new_dpi = (wparam.0 & 0xFFFF) as u32;
+            CURRENT_DPI.store(new_dpi, Ordering::Relaxed);
+            // lparam carries the position Windows suggests for the new scale;
+            // honour it, then re-fit the width to the rescaled content.
+            let suggested = &*(lparam.0 as *const RECT);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND::default(),
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            resize_window_to_content(hwnd);
+            repaint();
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
             if msg == WM_SETTINGCHANGE {
                 check_theme_change();
-                check_language_change();
             }
             refresh_dpi();
-            position_at_taskbar();
-            render_layered();
+            resize_window_to_content(hwnd);
+            repaint();
             LRESULT(0)
         }
         WM_TIMER => {
@@ -2283,7 +1271,7 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
-                    render_layered();
+                    repaint();
                     schedule_countdown_timer();
                 }
                 TIMER_RESET_POLL => {
@@ -2301,203 +1289,17 @@ unsafe extern "system" fn wnd_proc(
                         });
                     }
                 }
-                TIMER_UPDATE_CHECK => {
-                    begin_update_check(hwnd, false);
-                }
                 _ => {}
             }
             LRESULT(0)
         }
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
-            check_language_change();
-            render_layered();
+            repaint();
             schedule_countdown_timer();
-            suppress_tray_reposition_for(Duration::from_millis(
-                TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS,
-            ));
-            sync_tray_icons(hwnd);
             LRESULT(0)
         }
-        WM_APP_UPDATE_CHECK_COMPLETE => {
-            schedule_auto_update_check(hwnd);
-            LRESULT(0)
-        }
-        WM_SETCURSOR => {
-            let is_dragging = {
-                let state = lock_state();
-                state.as_ref().map(|s| s.dragging).unwrap_or(false)
-            };
-            if is_dragging {
-                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
-                SetCursor(cursor);
-                return LRESULT(1);
-            }
-            if cursor_is_on_drag_handle(hwnd) {
-                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
-                SetCursor(cursor);
-                return LRESULT(1);
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        WM_LBUTTONDOWN => {
-            let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
-            let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            if !is_drag_handle_point(client_x, client_y) {
-                return LRESULT(0);
-            }
-
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let mut state = lock_state();
-            if let Some(s) = state.as_mut() {
-                s.dragging = true;
-                s.drag_start_mouse_x = pt.x;
-                s.drag_start_client_x = client_x;
-                s.drag_start_offset = s.tray_offset;
-            }
-            SetCapture(hwnd);
-            LRESULT(0)
-        }
-        WM_MOUSEMOVE => {
-            let is_dragging = {
-                let state = lock_state();
-                state.as_ref().map(|s| s.dragging).unwrap_or(false)
-            };
-            if is_dragging {
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                let move_target = {
-                    let mut state = lock_state();
-                    let s = match state.as_mut() {
-                        Some(s) => s,
-                        None => return LRESULT(0),
-                    };
-
-                    // Moving mouse left = positive delta = larger offset (further left)
-                    let delta = s.drag_start_mouse_x - pt.x;
-                    let mut new_offset = s.drag_start_offset + delta;
-
-                    // Clamp: offset >= 0 (can't go right of default)
-                    if new_offset < 0 {
-                        new_offset = 0;
-                    }
-
-                    let taskbar_hwnd = s.taskbar_hwnd;
-                    let embedded = s.embedded;
-                    let hwnd_val = s.hwnd.to_hwnd();
-
-                    // Clamp: don't go past left edge of taskbar
-                    if let Some(taskbar_hwnd) = taskbar_hwnd {
-                        if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                            let mut tray_left = taskbar_rect.right;
-                            if let Some(tray_hwnd) =
-                                native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
-                            {
-                                if let Some(tray_rect) =
-                                    native_interop::get_window_rect_safe(tray_hwnd)
-                                {
-                                    tray_left = tray_rect.left;
-                                }
-                            }
-                            let widget_width = total_widget_width_for_state(s);
-                            let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-                            if new_offset > max_offset {
-                                new_offset = max_offset;
-                            }
-
-                            s.tray_offset = new_offset;
-
-                            let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-                            let anchor_top = taskbar_rect.top;
-                            let anchor_height = taskbar_height;
-                            let widget_height = sc(WIDGET_HEIGHT);
-                            let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-                            let x = if embedded {
-                                tray_left - taskbar_rect.left - widget_width - new_offset
-                            } else {
-                                tray_left - widget_width - new_offset
-                            };
-                            Some((
-                                hwnd_val,
-                                embedded,
-                                x,
-                                y,
-                                taskbar_rect.top,
-                                widget_width,
-                                widget_height,
-                            ))
-                        } else {
-                            s.tray_offset = new_offset;
-                            None
-                        }
-                    } else {
-                        s.tray_offset = new_offset;
-                        None
-                    }
-                };
-
-                if let Some((hwnd_val, embedded, x, y, taskbar_top, widget_width, widget_height)) =
-                    move_target
-                {
-                    if embedded {
-                        native_interop::move_window(
-                            hwnd_val,
-                            x,
-                            y - taskbar_top,
-                            widget_width,
-                            widget_height,
-                        );
-                    } else {
-                        native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
-                    }
-                }
-            }
-            LRESULT(0)
-        }
-        WM_LBUTTONUP => {
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let drag_result = {
-                let mut state = lock_state();
-                if let Some(s) = state.as_mut() {
-                    if s.dragging {
-                        s.dragging = false;
-                        Some((s.taskbar_index, s.drag_start_client_x))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
-            if let Some((current_taskbar_index, drag_start_client_x)) = drag_result {
-                let _ = ReleaseCapture();
-                if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
-                    if target_index != current_taskbar_index {
-                        let new_offset = offset_for_drop_point(
-                            target_taskbar.hwnd,
-                            target_taskbar.rect,
-                            pt,
-                            drag_start_client_x,
-                        );
-                        {
-                            let mut state = lock_state();
-                            if let Some(s) = state.as_mut() {
-                                s.tray_offset = new_offset;
-                            }
-                        }
-                        if attach_to_taskbar(hwnd, target_index) {
-                            position_at_taskbar();
-                            render_layered();
-                        }
-                    }
-                }
-                save_state_settings();
-            }
-            LRESULT(0)
-        }
-        WM_RBUTTONUP => {
+        WM_RBUTTONUP | WM_CONTEXTMENU => {
             show_context_menu(hwnd);
             LRESULT(0)
         }
@@ -2515,66 +1317,14 @@ unsafe extern "system" fn wnd_proc(
                             s.force_notify_auth_error = true;
                         }
                     }
-                    render_layered();
+                    repaint();
                     let sh = SendHwnd::from_hwnd(hwnd);
                     std::thread::spawn(move || {
                         do_poll(sh);
                     });
                 }
-                IDM_VERSION_ACTION => {
-                    let (install_channel, release) = {
-                        let state = lock_state();
-                        match state.as_ref() {
-                            Some(s) => (
-                                s.install_channel,
-                                match &s.update_status {
-                                    UpdateStatus::Available(release) => Some(release.clone()),
-                                    _ => None,
-                                },
-                            ),
-                            None => (InstallChannel::Portable, None),
-                        }
-                    };
-
-                    match install_channel {
-                        InstallChannel::Winget => {
-                            if release.is_some() {
-                                begin_winget_update(hwnd);
-                            } else {
-                                begin_update_check(hwnd, true);
-                            }
-                        }
-                        InstallChannel::Portable => {
-                            if let Some(release) = release {
-                                begin_update_apply(hwnd, release);
-                            } else {
-                                begin_update_check(hwnd, true);
-                            }
-                        }
-                    }
-                }
                 2 => {
-                    let hook = {
-                        let state = lock_state();
-                        state.as_ref().and_then(|s| s.win_event_hook)
-                    };
-                    if let Some(h) = hook {
-                        native_interop::unhook_win_event(h);
-                    }
-                    PostQuitMessage(0);
-                }
-                IDM_RESET_POSITION => {
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            s.tray_offset = 0;
-                        }
-                    }
-                    save_state_settings();
-                    position_at_taskbar();
-                }
-                IDM_START_WITH_WINDOWS => {
-                    set_startup_enabled(!is_startup_enabled());
+                    let _ = DestroyWindow(hwnd);
                 }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
@@ -2593,6 +1343,7 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
+                    refresh_menu_bar(hwnd);
                 }
                 IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
                     {
@@ -2622,79 +1373,25 @@ unsafe extern "system" fn wnd_proc(
                             s.codex_weekly_text = "...".to_string();
                             s.antigravity_session_text = "...".to_string();
                             s.antigravity_weekly_text = "...".to_string();
+                            set_window_title(s);
                         }
                     }
                     save_state_settings();
-                    position_at_taskbar();
-                    render_layered();
-                    sync_tray_icons(hwnd);
+                    refresh_menu_bar(hwnd);
+                    resize_window_to_content(hwnd);
+                    repaint();
                     let sh = SendHwnd::from_hwnd(hwnd);
                     std::thread::spawn(move || {
                         do_poll(sh);
                     });
                 }
-                IDM_LANG_SYSTEM
-                | IDM_LANG_ENGLISH
-                | IDM_LANG_DUTCH
-                | IDM_LANG_SPANISH
-                | IDM_LANG_FRENCH
-                | IDM_LANG_GERMAN
-                | IDM_LANG_JAPANESE
-                | IDM_LANG_KOREAN
-                | IDM_LANG_TRADITIONAL_CHINESE
-                | IDM_LANG_RUSSIAN
-                | IDM_LANG_PORTUGUESE_BRAZIL => {
-                    let language_override = match id {
-                        IDM_LANG_SYSTEM => None,
-                        IDM_LANG_ENGLISH => Some(LanguageId::English),
-                        IDM_LANG_DUTCH => Some(LanguageId::Dutch),
-                        IDM_LANG_SPANISH => Some(LanguageId::Spanish),
-                        IDM_LANG_FRENCH => Some(LanguageId::French),
-                        IDM_LANG_GERMAN => Some(LanguageId::German),
-                        IDM_LANG_JAPANESE => Some(LanguageId::Japanese),
-                        IDM_LANG_KOREAN => Some(LanguageId::Korean),
-                        IDM_LANG_TRADITIONAL_CHINESE => Some(LanguageId::TraditionalChinese),
-                        IDM_LANG_RUSSIAN => Some(LanguageId::Russian),
-                        IDM_LANG_PORTUGUESE_BRAZIL => Some(LanguageId::PortugueseBrazil),
-                        _ => None,
-                    };
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            apply_language_to_state(s, language_override);
-                        }
-                    }
-                    save_state_settings();
-                    render_layered();
-                }
-                id if id == tray_icon::IDM_TOGGLE_WIDGET => {
-                    toggle_widget_visibility(hwnd);
-                }
                 _ => {}
             }
             LRESULT(0)
         }
-        _ if msg == WM_APP_TRAY => {
-            match tray_icon::handle_message(lparam) {
-                tray_icon::TrayAction::ToggleWidget => {
-                    toggle_widget_visibility(hwnd);
-                }
-                tray_icon::TrayAction::ShowContextMenu => {
-                    show_context_menu(hwnd);
-                }
-                tray_icon::TrayAction::None => {}
-            }
-            LRESULT(0)
-        }
         WM_DESTROY => {
-            let hook = {
-                let state = lock_state();
-                state.as_ref().and_then(|s| s.win_event_hook)
-            };
-            if let Some(h) = hook {
-                native_interop::unhook_win_event(h);
-            }
-            tray_icon::remove_all(hwnd);
+            remember_window_position(hwnd);
+            save_state_settings();
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -2702,262 +1399,153 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+/// Append every application command to `menu`. Shared by the window's menu bar
+/// and by the right-click context menu so the two can never drift apart.
+unsafe fn append_app_menu_items(menu: HMENU) {
+    let (current_interval, show_claude_code, show_codex, show_antigravity) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => (
+                s.poll_interval_ms,
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+            ),
+            None => (POLL_15_MIN, true, false, false),
+        }
+    };
+    let refresh_str = native_interop::wide_str(strings::REFRESH);
+    let _ = AppendMenuW(
+        menu,
+        MENU_ITEM_FLAGS(0),
+        1,
+        PCWSTR::from_raw(refresh_str.as_ptr()),
+    );
+
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+    // Update Frequency submenu
+    let freq_menu = CreatePopupMenu().unwrap();
+    let freq_items: [(u16, u32, &str); 4] = [
+        (IDM_FREQ_1MIN, POLL_1_MIN, strings::ONE_MINUTE),
+        (IDM_FREQ_5MIN, POLL_5_MIN, strings::FIVE_MINUTES),
+        (IDM_FREQ_15MIN, POLL_15_MIN, strings::FIFTEEN_MINUTES),
+        (IDM_FREQ_1HOUR, POLL_1_HOUR, strings::ONE_HOUR),
+    ];
+    for (id, interval, label) in freq_items {
+        let label_str = native_interop::wide_str(label);
+        let flags = if interval == current_interval {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            freq_menu,
+            flags,
+            id as usize,
+            PCWSTR::from_raw(label_str.as_ptr()),
+        );
+    }
+
+    let freq_label = native_interop::wide_str(strings::UPDATE_FREQUENCY);
+    let _ = AppendMenuW(
+        menu,
+        MF_POPUP,
+        freq_menu.0 as usize,
+        PCWSTR::from_raw(freq_label.as_ptr()),
+    );
+
+    // Models submenu
+    let models_menu = CreatePopupMenu().unwrap();
+    let model_items: [(u16, bool, &str); 3] = [
+        (
+            IDM_MODEL_CLAUDE_CODE,
+            show_claude_code,
+            strings::CLAUDE_CODE_MODEL,
+        ),
+        (IDM_MODEL_CODEX, show_codex, strings::CODEX_MODEL),
+        (
+            IDM_MODEL_ANTIGRAVITY,
+            show_antigravity,
+            strings::ANTIGRAVITY_MODEL,
+        ),
+    ];
+    for (id, enabled, label) in model_items {
+        let label_str = native_interop::wide_str(label);
+        let flags = if enabled {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            models_menu,
+            flags,
+            id as usize,
+            PCWSTR::from_raw(label_str.as_ptr()),
+        );
+    }
+
+    let models_label = native_interop::wide_str(strings::MODELS);
+    let _ = AppendMenuW(
+        menu,
+        MF_POPUP,
+        models_menu.0 as usize,
+        PCWSTR::from_raw(models_label.as_ptr()),
+    );
+
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+    let exit_str = native_interop::wide_str(strings::EXIT);
+    let _ = AppendMenuW(
+        menu,
+        MENU_ITEM_FLAGS(0),
+        2,
+        PCWSTR::from_raw(exit_str.as_ptr()),
+    );
+}
+
+/// (Re)build the window's menu bar. Called whenever a checked state changes,
+/// since menu items are built with their state baked in.
+fn refresh_menu_bar(hwnd: HWND) {
+    let label = strings::SETTINGS;
+
+    unsafe {
+        let Ok(bar) = CreateMenu() else {
+            return;
+        };
+        let Ok(popup) = CreatePopupMenu() else {
+            let _ = DestroyMenu(bar);
+            return;
+        };
+        append_app_menu_items(popup);
+
+        let label_str = native_interop::wide_str(label);
+        let _ = AppendMenuW(
+            bar,
+            MF_POPUP,
+            popup.0 as usize,
+            PCWSTR::from_raw(label_str.as_ptr()),
+        );
+
+        let previous = GetMenu(hwnd);
+        if SetMenu(hwnd, bar).is_ok() {
+            if !previous.is_invalid() {
+                let _ = DestroyMenu(previous);
+            }
+            let _ = DrawMenuBar(hwnd);
+        } else {
+            let _ = DestroyMenu(bar);
+        }
+    }
+}
+
+/// The same commands as the menu bar, shown where the user right-clicked.
 fn show_context_menu(hwnd: HWND) {
     unsafe {
-        let (
-            current_interval,
-            strings,
-            language,
-            language_override,
-            install_channel,
-            update_status,
-            widget_visible,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-        ) = {
-            let state = lock_state();
-            match state.as_ref() {
-                Some(s) => (
-                    s.poll_interval_ms,
-                    s.language.strings(),
-                    s.language,
-                    s.language_override,
-                    s.install_channel,
-                    s.update_status.clone(),
-                    s.widget_visible,
-                    s.show_claude_code,
-                    s.show_codex,
-                    s.show_antigravity,
-                ),
-                None => (
-                    POLL_15_MIN,
-                    LanguageId::English.strings(),
-                    LanguageId::English,
-                    None,
-                    InstallChannel::Portable,
-                    UpdateStatus::Idle,
-                    true,
-                    true,
-                    false,
-                    false,
-                ),
-            }
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
         };
-
-        let menu = CreatePopupMenu().unwrap();
-
-        let refresh_str = native_interop::wide_str(strings.refresh);
-        let _ = AppendMenuW(
-            menu,
-            MENU_ITEM_FLAGS(0),
-            1,
-            PCWSTR::from_raw(refresh_str.as_ptr()),
-        );
-
-        // Update Frequency submenu
-        let freq_menu = CreatePopupMenu().unwrap();
-        let freq_items: [(u16, u32, &str); 4] = [
-            (IDM_FREQ_1MIN, POLL_1_MIN, strings.one_minute),
-            (IDM_FREQ_5MIN, POLL_5_MIN, strings.five_minutes),
-            (IDM_FREQ_15MIN, POLL_15_MIN, strings.fifteen_minutes),
-            (IDM_FREQ_1HOUR, POLL_1_HOUR, strings.one_hour),
-        ];
-        for (id, interval, label) in freq_items {
-            let label_str = native_interop::wide_str(label);
-            let flags = if interval == current_interval {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(
-                freq_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label_str.as_ptr()),
-            );
-        }
-
-        let freq_label = native_interop::wide_str(strings.update_frequency);
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            freq_menu.0 as usize,
-            PCWSTR::from_raw(freq_label.as_ptr()),
-        );
-
-        // Models submenu
-        let models_menu = CreatePopupMenu().unwrap();
-        let claude_model = native_interop::wide_str(strings.claude_code_model);
-        let claude_flags = if show_claude_code {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            claude_flags,
-            IDM_MODEL_CLAUDE_CODE as usize,
-            PCWSTR::from_raw(claude_model.as_ptr()),
-        );
-
-        let codex_model = native_interop::wide_str(strings.codex_model);
-        let codex_flags = if show_codex {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            codex_flags,
-            IDM_MODEL_CODEX as usize,
-            PCWSTR::from_raw(codex_model.as_ptr()),
-        );
-
-        let antigravity_model = native_interop::wide_str(strings.antigravity_model);
-        let antigravity_flags = if show_antigravity {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            antigravity_flags,
-            IDM_MODEL_ANTIGRAVITY as usize,
-            PCWSTR::from_raw(antigravity_model.as_ptr()),
-        );
-
-        let models_label = native_interop::wide_str(strings.models);
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            models_menu.0 as usize,
-            PCWSTR::from_raw(models_label.as_ptr()),
-        );
-
-        // Settings submenu
-        let settings_menu = CreatePopupMenu().unwrap();
-
-        let startup_str = native_interop::wide_str(strings.start_with_windows);
-        let startup_flags = if is_startup_enabled() {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            settings_menu,
-            startup_flags,
-            IDM_START_WITH_WINDOWS as usize,
-            PCWSTR::from_raw(startup_str.as_ptr()),
-        );
-
-        let reset_pos_str = native_interop::wide_str(strings.reset_position);
-        let _ = AppendMenuW(
-            settings_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_RESET_POSITION as usize,
-            PCWSTR::from_raw(reset_pos_str.as_ptr()),
-        );
-
-        let language_menu = CreatePopupMenu().unwrap();
-        let system_label = native_interop::wide_str(strings.system_default);
-        let system_flags = if language_override.is_none() {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            language_menu,
-            system_flags,
-            IDM_LANG_SYSTEM as usize,
-            PCWSTR::from_raw(system_label.as_ptr()),
-        );
-
-        for language in LanguageId::ALL {
-            let id = match language {
-                LanguageId::English => IDM_LANG_ENGLISH,
-                LanguageId::Dutch => IDM_LANG_DUTCH,
-                LanguageId::Spanish => IDM_LANG_SPANISH,
-                LanguageId::French => IDM_LANG_FRENCH,
-                LanguageId::German => IDM_LANG_GERMAN,
-                LanguageId::Japanese => IDM_LANG_JAPANESE,
-                LanguageId::Korean => IDM_LANG_KOREAN,
-                LanguageId::TraditionalChinese => IDM_LANG_TRADITIONAL_CHINESE,
-                LanguageId::Russian => IDM_LANG_RUSSIAN,
-                LanguageId::PortugueseBrazil => IDM_LANG_PORTUGUESE_BRAZIL,
-            };
-            let label_str = native_interop::wide_str(language.native_name());
-            let flags = if language_override == Some(language) {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(
-                language_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label_str.as_ptr()),
-            );
-        }
-
-        let language_label = native_interop::wide_str(strings.language);
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            language_menu.0 as usize,
-            PCWSTR::from_raw(language_label.as_ptr()),
-        );
-
-        let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-        let version_label =
-            version_action_label(strings, language, install_channel, &update_status);
-        let version_str = native_interop::wide_str(&version_label);
-        let version_flags = if matches!(
-            update_status,
-            UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            MF_GRAYED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            settings_menu,
-            version_flags,
-            IDM_VERSION_ACTION as usize,
-            PCWSTR::from_raw(version_str.as_ptr()),
-        );
-
-        let settings_label = native_interop::wide_str(strings.settings);
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            settings_menu.0 as usize,
-            PCWSTR::from_raw(settings_label.as_ptr()),
-        );
-
-        let widget_label = native_interop::wide_str(strings.show_widget);
-        let widget_flags = if widget_visible {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            menu,
-            widget_flags,
-            tray_icon::IDM_TOGGLE_WIDGET as usize,
-            PCWSTR::from_raw(widget_label.as_ptr()),
-        );
-
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-        let exit_str = native_interop::wide_str(strings.exit);
-        let _ = AppendMenuW(
-            menu,
-            MENU_ITEM_FLAGS(0),
-            2,
-            PCWSTR::from_raw(exit_str.as_ptr()),
-        );
+        append_app_menu_items(menu);
 
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -2967,11 +1555,10 @@ fn show_context_menu(hwnd: HWND) {
     }
 }
 
-/// Paint for non-embedded fallback (normal WM_PAINT path)
+/// Draw the window content into the device context supplied by WM_PAINT.
 fn paint(hdc: HDC, hwnd: HWND) {
     let (
         is_dark,
-        strings,
         session_pct,
         session_text,
         weekly_pct,
@@ -2992,7 +1579,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
         match state.as_ref() {
             Some(s) => (
                 s.is_dark,
-                s.language.strings(),
                 s.session_percent,
                 s.session_text.clone(),
                 s.weekly_percent,
@@ -3012,7 +1598,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
             None => return,
         }
     };
-
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
     let antigravity_accent = antigravity_accent_color();
@@ -3055,7 +1640,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &text_color,
             &accent,
             &track,
-            strings,
             session_pct,
             &session_text,
             weekly_pct,
