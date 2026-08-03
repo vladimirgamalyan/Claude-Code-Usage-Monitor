@@ -15,9 +15,10 @@ use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
-use crate::models::AppUsageData;
+use crate::models::{AppUsageData, CodexResetCredits};
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_CREDITS, TIMER_RESET_POLL,
+    WM_APP_RESET_CREDITS_UPDATED, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::strings;
@@ -55,13 +56,20 @@ struct AppState {
     antigravity_session_text: String,
     antigravity_weekly_percent: f64,
     antigravity_weekly_text: String,
+    /// One rendered line per Codex reset in hand, soonest to lapse first. Empty
+    /// when there is none, and the rows are left out of the window entirely.
+    codex_reset_lines: Vec<String>,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
 
     data: Option<AppUsageData>,
+    codex_reset_credits: Option<CodexResetCredits>,
+    /// Credit count from the last usage poll, kept to spot when it moves.
+    last_codex_reset_credit_count: Option<usize>,
 
     poll_interval_ms: u32,
+    reset_credit_interval_ms: u32,
     retry_count: u32,
     force_notify_auth_error: bool,
     auth_error_paused_polling: bool,
@@ -82,11 +90,20 @@ const POLL_5_MIN: u32 = 300_000;
 const POLL_15_MIN: u32 = 900_000;
 const POLL_1_HOUR: u32 = 3_600_000;
 
+const RESET_CREDITS_1_HOUR: u32 = 3_600_000;
+const RESET_CREDITS_6_HOURS: u32 = 21_600_000;
+const RESET_CREDITS_12_HOURS: u32 = 43_200_000;
+const RESET_CREDITS_1_DAY: u32 = 86_400_000;
+
 // Menu item IDs for update frequency
 const IDM_FREQ_1MIN: u16 = 10;
 const IDM_FREQ_5MIN: u16 = 11;
 const IDM_FREQ_15MIN: u16 = 12;
 const IDM_FREQ_1HOUR: u16 = 13;
+const IDM_RESET_FREQ_1HOUR: u16 = 20;
+const IDM_RESET_FREQ_6HOURS: u16 = 21;
+const IDM_RESET_FREQ_12HOURS: u16 = 22;
+const IDM_RESET_FREQ_1DAY: u16 = 23;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
@@ -168,6 +185,8 @@ struct SettingsFile {
     window_y: Option<i32>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
+    #[serde(default = "default_reset_credit_interval")]
+    reset_credit_interval_ms: u32,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
@@ -182,6 +201,7 @@ impl Default for SettingsFile {
             window_x: None,
             window_y: None,
             poll_interval_ms: default_poll_interval(),
+            reset_credit_interval_ms: default_reset_credit_interval(),
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
@@ -191,6 +211,11 @@ impl Default for SettingsFile {
 
 fn default_poll_interval() -> u32 {
     POLL_15_MIN
+}
+
+/// Reset credits are granted and spent by hand, so they are checked rarely.
+fn default_reset_credit_interval() -> u32 {
+    RESET_CREDITS_6_HOURS
 }
 
 fn default_show_claude_code() -> bool {
@@ -234,6 +259,7 @@ fn save_state_settings() {
             window_x: s.window_x,
             window_y: s.window_y,
             poll_interval_ms: s.poll_interval_ms,
+            reset_credit_interval_ms: s.reset_credit_interval_ms,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
@@ -267,19 +293,65 @@ fn window_size_for_client(client_width: i32, client_height: i32) -> (i32, i32) {
     (rect.right - rect.left, rect.bottom - rect.top)
 }
 
-/// Resize the window so the content fits exactly, keeping its position.
+/// Resize the window so the content fits exactly, keeping its position - except
+/// where growing would push the content off the bottom or right of the screen,
+/// which is easy to hit now that reset credits add rows.
 fn resize_window_to_content(hwnd: HWND) {
     let (width, height) = window_size_for_client(client_width(), client_height());
     unsafe {
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND::default(),
+                0,
+                0,
+                width,
+                height,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            return;
+        }
+
+        let (x, y) = nudge_onto_work_area(hwnd, rect.left, rect.top, width, height);
         let _ = SetWindowPos(
             hwnd,
             HWND::default(),
-            0,
-            0,
+            x,
+            y,
             width,
             height,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_NOZORDER | SWP_NOACTIVATE,
         );
+    }
+}
+
+/// Pull a window back just far enough to fit on its monitor's work area. Only
+/// the far edges are corrected: a window the user has deliberately parked a
+/// little off the left or top stays where they put it.
+fn nudge_onto_work_area(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return (x, y);
+        }
+
+        let work = info.rcWork;
+        let x = if x + width > work.right {
+            (work.right - width).max(work.left)
+        } else {
+            x
+        };
+        let y = if y + height > work.bottom {
+            (work.bottom - height).max(work.top)
+        } else {
+            y
+        };
+        (x, y)
     }
 }
 
@@ -414,6 +486,16 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 }
 
+/// Re-render the Codex reset credit lines. Kept out of `refresh_usage_texts`
+/// because they survive a failed usage poll: the credits come from their own
+/// endpoint on their own schedule.
+fn refresh_reset_credit_lines(state: &mut AppState) {
+    state.codex_reset_lines = match state.codex_reset_credits.as_ref() {
+        Some(credits) if state.show_codex => poller::reset_credit_lines(credits),
+        _ => Vec::new(),
+    };
+}
+
 /// Caption text: name the single provider being shown, if there is only one.
 fn window_title_for(
     show_claude_code: bool,
@@ -476,9 +558,28 @@ const ROW_GAP: i32 = 12;
 /// a single model makes the content itself narrower than that.
 const MIN_CLIENT_WIDTH: i32 = 330;
 
-/// Client height needed for both rows plus padding, at the current DPI.
+/// How many rows the Codex resets in hand take up - one each.
+fn reset_row_count() -> i32 {
+    let state = lock_state();
+    state
+        .as_ref()
+        .filter(|s| s.show_codex)
+        .map(|s| s.codex_reset_lines.len() as i32)
+        .unwrap_or(0)
+}
+
+fn visible_row_count() -> i32 {
+    2 + reset_row_count()
+}
+
+/// Height of the drawn rows themselves, without the outer padding.
+fn content_height_for(rows: i32) -> i32 {
+    sc(SEGMENT_H) * rows + sc(ROW_GAP) * (rows - 1)
+}
+
+/// Client height needed for every visible row plus padding, at the current DPI.
 fn client_height() -> i32 {
-    sc(CONTENT_PADDING_Y) * 2 + sc(SEGMENT_H) * 2 + sc(ROW_GAP)
+    sc(CONTENT_PADDING_Y) * 2 + content_height_for(visible_row_count())
 }
 
 /// Client width at the current DPI: the content, or the minimum if wider.
@@ -702,11 +803,15 @@ pub fn run() {
                 antigravity_session_text: "--".to_string(),
                 antigravity_weekly_percent: 0.0,
                 antigravity_weekly_text: "--".to_string(),
+                codex_reset_lines: Vec::new(),
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
                 data: None,
+                codex_reset_credits: None,
+                last_codex_reset_credit_count: None,
                 poll_interval_ms: settings.poll_interval_ms,
+                reset_credit_interval_ms: settings.reset_credit_interval_ms,
                 retry_count: 0,
                 force_notify_auth_error: false,
                 auth_error_paused_polling: false,
@@ -752,6 +857,8 @@ pub fn run() {
             diagnose::log("initial poll thread started");
             do_poll(send_hwnd);
         });
+
+        sync_reset_credit_timer(hwnd, settings.show_codex);
 
         // Initial theme check
         check_theme_change();
@@ -819,6 +926,7 @@ fn paint_content(
     antigravity_session_text: &str,
     antigravity_weekly_pct: f64,
     antigravity_weekly_text: &str,
+    codex_reset_lines: &[String],
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -839,10 +947,12 @@ fn paint_content(
 
         // Centre the content so it stays balanced when the window is wider than
         // the content needs, or a pixel or two taller than we asked for.
-        let content_h = sc(SEGMENT_H) * 2 + sc(ROW_GAP);
+        let rows = 2 + codex_reset_lines.len() as i32;
+        let content_h = content_height_for(rows);
         let content_x = ((width - content_inner_width()) / 2).max(sc(CONTENT_PADDING_X));
         let row1_y = ((height - content_h) / 2).max(sc(CONTENT_PADDING_Y));
-        let row2_y = row1_y + sc(SEGMENT_H) + sc(ROW_GAP);
+        let row_pitch = sc(SEGMENT_H) + sc(ROW_GAP);
+        let row2_y = row1_y + row_pitch;
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -908,6 +1018,19 @@ fn paint_content(
             antigravity_accent,
             track,
         );
+        for (index, reset_text) in codex_reset_lines.iter().enumerate() {
+            draw_reset_row(
+                hdc,
+                content_x,
+                row2_y + row_pitch * (index as i32 + 1),
+                is_dark,
+                text_color,
+                reset_text,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+            );
+        }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
@@ -926,8 +1049,13 @@ fn do_poll(send_hwnd: SendHwnd) {
 
     match poller::poll(show_claude_code, show_codex, show_antigravity) {
         Ok(data) => {
+            let mut refetch_reset_credits = false;
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
+                refetch_reset_credits = reset_credits_look_stale(s, &data);
+                if let Some(count) = data.codex_reset_credits_available {
+                    s.last_codex_reset_credit_count = Some(count);
+                }
                 if let Some(claude_code) = data.claude_code.as_ref() {
                     s.session_percent = claude_code.session.percentage;
                     s.weekly_percent = claude_code.weekly.percentage;
@@ -972,6 +1100,16 @@ fn do_poll(send_hwnd: SendHwnd) {
                 s.auth_error_paused_polling = false;
                 s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
                 s.auth_watch_snapshot.clear();
+            }
+            drop(state);
+
+            // The count moved, so the expiry dates behind it are worth re-reading
+            // now rather than at the next scheduled check.
+            if refetch_reset_credits {
+                let sh = SendHwnd::from_hwnd(hwnd);
+                std::thread::spawn(move || {
+                    do_reset_credit_poll(sh);
+                });
             }
 
             unsafe {
@@ -1086,6 +1224,82 @@ fn do_poll(send_hwnd: SendHwnd) {
     }
 }
 
+/// Every usage poll carries the number of reset credits in hand, so a change
+/// there is a free signal that the credit list - and the expiry dates only that
+/// list carries - needs re-reading. Also fires the first time a count arrives
+/// while no list has been fetched yet, which covers a failed startup fetch.
+fn reset_credits_look_stale(state: &AppState, data: &AppUsageData) -> bool {
+    poller::reset_credits_need_refresh(
+        state.last_codex_reset_credit_count,
+        data.codex_reset_credits_available,
+        state.codex_reset_credits.is_some(),
+    )
+}
+
+/// Start or stop the reset credit timer to match whether Codex is on show,
+/// kicking off an immediate poll whenever it is (re)enabled.
+fn sync_reset_credit_timer(hwnd: HWND, show_codex: bool) {
+    unsafe {
+        let _ = KillTimer(hwnd, TIMER_RESET_CREDITS);
+    }
+
+    if !show_codex {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.codex_reset_credits = None;
+            s.codex_reset_lines = Vec::new();
+            s.last_codex_reset_credit_count = None;
+        }
+        return;
+    }
+
+    let interval = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| s.reset_credit_interval_ms)
+            .unwrap_or(RESET_CREDITS_6_HOURS)
+    };
+    unsafe {
+        SetTimer(hwnd, TIMER_RESET_CREDITS, interval, None);
+    }
+
+    let sh = SendHwnd::from_hwnd(hwnd);
+    std::thread::spawn(move || {
+        do_reset_credit_poll(sh);
+    });
+}
+
+/// Fetch the reset credits Codex has granted. A failure keeps whatever was last
+/// known rather than blanking the row - these change far too rarely for a
+/// transient error to be worth surfacing.
+fn do_reset_credit_poll(send_hwnd: SendHwnd) {
+    let hwnd = send_hwnd.to_hwnd();
+    let show_codex = {
+        let state = lock_state();
+        state.as_ref().map(|s| s.show_codex).unwrap_or(false)
+    };
+    if !show_codex {
+        return;
+    }
+
+    match poller::poll_codex_reset_credits() {
+        Ok(credits) => {
+            {
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.codex_reset_credits = Some(credits);
+                    refresh_reset_credit_lines(s);
+                }
+            }
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_RESET_CREDITS_UPDATED, WPARAM(0), LPARAM(0));
+            }
+        }
+        Err(error) => diagnose::log(format!("Codex reset credit poll failed: {error:?}")),
+    }
+}
+
 fn schedule_countdown_timer() {
     let state = lock_state();
     let s = match state.as_ref() {
@@ -1094,10 +1308,24 @@ fn schedule_countdown_timer() {
     };
 
     let hwnd = s.hwnd.to_hwnd();
+    // The reset credit row keeps counting down even when usage polling is
+    // broken - its data comes from elsewhere and is still valid.
+    let credit_delay = s
+        .codex_reset_credits
+        .as_ref()
+        .and_then(poller::reset_credits_time_until_display_change);
+
     if !s.last_poll_ok {
         unsafe {
-            let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
             let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+            match credit_delay {
+                Some(delay) => {
+                    SetTimer(hwnd, TIMER_COUNTDOWN, countdown_timer_ms(Some(delay)), None);
+                }
+                None => {
+                    let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
+                }
+            }
         }
         return;
     }
@@ -1133,17 +1361,22 @@ fn schedule_countdown_timer() {
         data.antigravity
             .as_ref()
             .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+        credit_delay,
     ];
     let min_delay = delays.into_iter().flatten().min();
 
-    let ms = min_delay
+    unsafe {
+        SetTimer(hwnd, TIMER_COUNTDOWN, countdown_timer_ms(min_delay), None);
+    }
+}
+
+/// A missing delay falls back to a minute; anything shorter than a second is
+/// rounded up so the timer cannot spin.
+fn countdown_timer_ms(delay: Option<Duration>) -> u32 {
+    delay
         .unwrap_or(Duration::from_secs(60))
         .as_millis()
-        .max(1000) as u32;
-
-    unsafe {
-        SetTimer(hwnd, TIMER_COUNTDOWN, ms, None);
-    }
+        .max(1000) as u32
 }
 
 fn check_theme_change() {
@@ -1170,6 +1403,8 @@ fn update_display() {
         Some(s) => s,
         None => return,
     };
+
+    refresh_reset_credit_lines(s);
 
     // Don't overwrite error text with stale cached data
     if !s.last_poll_ok {
@@ -1271,8 +1506,16 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
+                    // An expiring credit takes its row with it.
+                    resize_window_to_content(hwnd);
                     repaint();
                     schedule_countdown_timer();
+                }
+                TIMER_RESET_CREDITS => {
+                    let sh = SendHwnd::from_hwnd(hwnd);
+                    std::thread::spawn(move || {
+                        do_reset_credit_poll(sh);
+                    });
                 }
                 TIMER_RESET_POLL => {
                     let should_poll = {
@@ -1295,6 +1538,14 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
+            repaint();
+            schedule_countdown_timer();
+            LRESULT(0)
+        }
+        WM_APP_RESET_CREDITS_UPDATED => {
+            // The row appears and disappears with the credits, so the window has
+            // to be re-fitted around it.
+            resize_window_to_content(hwnd);
             repaint();
             schedule_countdown_timer();
             LRESULT(0)
@@ -1322,6 +1573,16 @@ unsafe extern "system" fn wnd_proc(
                     std::thread::spawn(move || {
                         do_poll(sh);
                     });
+                    let show_codex = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.show_codex).unwrap_or(false)
+                    };
+                    if show_codex {
+                        let sh = SendHwnd::from_hwnd(hwnd);
+                        std::thread::spawn(move || {
+                            do_reset_credit_poll(sh);
+                        });
+                    }
                 }
                 2 => {
                     let _ = DestroyWindow(hwnd);
@@ -1343,6 +1604,26 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
+                    refresh_menu_bar(hwnd);
+                }
+                IDM_RESET_FREQ_1HOUR
+                | IDM_RESET_FREQ_6HOURS
+                | IDM_RESET_FREQ_12HOURS
+                | IDM_RESET_FREQ_1DAY => {
+                    let new_interval = match id {
+                        IDM_RESET_FREQ_1HOUR => RESET_CREDITS_1_HOUR,
+                        IDM_RESET_FREQ_12HOURS => RESET_CREDITS_12_HOURS,
+                        IDM_RESET_FREQ_1DAY => RESET_CREDITS_1_DAY,
+                        _ => RESET_CREDITS_6_HOURS,
+                    };
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.reset_credit_interval_ms = new_interval;
+                        }
+                    }
+                    save_state_settings();
+                    SetTimer(hwnd, TIMER_RESET_CREDITS, new_interval, None);
                     refresh_menu_bar(hwnd);
                 }
                 IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
@@ -1377,6 +1658,11 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                     save_state_settings();
+                    let show_codex = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.show_codex).unwrap_or(false)
+                    };
+                    sync_reset_credit_timer(hwnd, show_codex);
                     refresh_menu_bar(hwnd);
                     resize_window_to_content(hwnd);
                     repaint();
@@ -1402,16 +1688,23 @@ unsafe extern "system" fn wnd_proc(
 /// Append every application command to `menu`. Shared by the window's menu bar
 /// and by the right-click context menu so the two can never drift apart.
 unsafe fn append_app_menu_items(menu: HMENU) {
-    let (current_interval, show_claude_code, show_codex, show_antigravity) = {
+    let (current_interval, current_reset_interval, show_claude_code, show_codex, show_antigravity) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
                 s.poll_interval_ms,
+                s.reset_credit_interval_ms,
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
             ),
-            None => (POLL_15_MIN, true, false, false),
+            None => (
+                POLL_15_MIN,
+                default_reset_credit_interval(),
+                true,
+                false,
+                false,
+            ),
         }
     };
     let refresh_str = native_interop::wide_str(strings::REFRESH);
@@ -1454,6 +1747,51 @@ unsafe fn append_app_menu_items(menu: HMENU) {
         freq_menu.0 as usize,
         PCWSTR::from_raw(freq_label.as_ptr()),
     );
+
+    // Reset credits belong to Codex, so the setting only shows with Codex on.
+    if show_codex {
+        let reset_freq_menu = CreatePopupMenu().unwrap();
+        let reset_freq_items: [(u16, u32, &str); 4] = [
+            (
+                IDM_RESET_FREQ_1HOUR,
+                RESET_CREDITS_1_HOUR,
+                strings::ONE_HOUR,
+            ),
+            (
+                IDM_RESET_FREQ_6HOURS,
+                RESET_CREDITS_6_HOURS,
+                strings::SIX_HOURS,
+            ),
+            (
+                IDM_RESET_FREQ_12HOURS,
+                RESET_CREDITS_12_HOURS,
+                strings::TWELVE_HOURS,
+            ),
+            (IDM_RESET_FREQ_1DAY, RESET_CREDITS_1_DAY, strings::ONE_DAY),
+        ];
+        for (id, interval, label) in reset_freq_items {
+            let label_str = native_interop::wide_str(label);
+            let flags = if interval == current_reset_interval {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                reset_freq_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+
+        let reset_freq_label = native_interop::wide_str(strings::RESET_CREDIT_FREQUENCY);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            reset_freq_menu.0 as usize,
+            PCWSTR::from_raw(reset_freq_label.as_ptr()),
+        );
+    }
 
     // Models submenu
     let models_menu = CreatePopupMenu().unwrap();
@@ -1571,6 +1909,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         antigravity_session_text,
         antigravity_weekly_pct,
         antigravity_weekly_text,
+        codex_reset_lines,
         show_claude_code,
         show_codex,
         show_antigravity,
@@ -1591,6 +1930,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.antigravity_session_text.clone(),
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
+                s.codex_reset_lines.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
@@ -1652,6 +1992,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &antigravity_session_text,
             antigravity_weekly_pct,
             &antigravity_weekly_text,
+            &codex_reset_lines,
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -1766,6 +2107,68 @@ fn draw_row(
                 &antigravity_value_color,
             );
         }
+    }
+}
+
+/// The resets-in-hand row: no bar to fill, just the count and how long the
+/// soonest credit has left, aligned under the Codex column's usage text.
+fn draw_reset_row(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    is_dark: bool,
+    text_color: &Color,
+    text: &str,
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+) {
+    let seg_h = sc(SEGMENT_H);
+    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let segment_count = row_bar_segment_count(active_models);
+    let value_color = if active_models > 1 {
+        codex_usage_text_color(is_dark)
+    } else {
+        *text_color
+    };
+
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let mut label_wide: Vec<u16> = strings::RESET_CREDIT_WINDOW.encode_utf16().collect();
+        let mut label_rect = RECT {
+            left: x,
+            top: y,
+            right: x + sc(LABEL_WIDTH),
+            bottom: y + seg_h,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut label_wide,
+            &mut label_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        let mut column_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        if show_claude_code {
+            column_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+        }
+
+        let text_x = column_x + segment_count * (sc(SEGMENT_W) + sc(SEGMENT_GAP)) - sc(SEGMENT_GAP)
+            + sc(BAR_RIGHT_MARGIN);
+        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+        let mut text_rect = RECT {
+            left: text_x,
+            top: y,
+            right: text_x + sc(TEXT_WIDTH),
+            bottom: y + seg_h,
+        };
+        let _ = SetTextColor(hdc, COLORREF(value_color.to_colorref()));
+        let _ = DrawTextW(
+            hdc,
+            &mut text_wide,
+            &mut text_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
     }
 }
 

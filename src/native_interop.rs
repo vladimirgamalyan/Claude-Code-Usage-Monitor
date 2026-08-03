@@ -2,10 +2,12 @@
 pub const TIMER_POLL: usize = 1;
 pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_RESET_POLL: usize = 3;
+pub const TIMER_RESET_CREDITS: usize = 4;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
 pub const WM_APP_USAGE_UPDATED: u32 = WM_APP + 1;
+pub const WM_APP_RESET_CREDITS_UPDATED: u32 = WM_APP + 2;
 
 /// Convert a Rust string to a null-terminated wide string
 pub fn wide_str(s: &str) -> Vec<u16> {

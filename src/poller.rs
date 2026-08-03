@@ -11,12 +11,14 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::http;
-use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::models::{AppUsageData, CodexResetCredits, UsageData, UsageSection};
 use crate::strings;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_RESET_CREDITS_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.googleapis.com",
@@ -70,6 +72,14 @@ struct CodexTokenData {
 #[derive(Deserialize)]
 struct CodexUsageResponse {
     rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
+    /// The same tally the reset credits endpoint returns, carried along with
+    /// every usage response.
+    rate_limit_reset_credits: Option<CodexResetCreditsSummary>,
+}
+
+#[derive(Deserialize)]
+struct CodexResetCreditsSummary {
+    available_count: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +94,28 @@ struct CodexRateLimitWindow {
     reset_at: i64,
     /// Length of the window itself, e.g. 18000 for 5 hours or 604800 for 7 days.
     limit_window_seconds: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CodexResetCreditsResponse {
+    credits: Option<Vec<CodexResetCreditEntry>>,
+    /// Fallback for responses that only carry a count, without the per-credit list.
+    available_count: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CodexResetCreditEntry {
+    /// "available", "redeeming", "redeemed", "expired".
+    status: Option<String>,
+    expires_at: Option<String>,
+    is_supported_by_plan: Option<bool>,
+}
+
+impl CodexResetCreditEntry {
+    fn is_redeemable(&self) -> bool {
+        self.is_supported_by_plan.unwrap_or(true)
+            && self.status.as_deref().unwrap_or("available") == "available"
+    }
 }
 
 #[derive(Deserialize)]
@@ -174,6 +206,9 @@ extern "system" {
     fn CredFree(buffer: *mut c_void);
 }
 
+/// Codex usage, alongside the reset credit count that rides in the same response.
+type CodexPoll = Result<(UsageData, Option<usize>), PollError>;
+
 pub fn poll(
     show_claude_code: bool,
     show_codex: bool,
@@ -194,7 +229,7 @@ fn poll_with(
     show_codex: bool,
     show_antigravity: bool,
     mut poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
+    mut poll_codex: impl FnMut() -> CodexPoll,
     mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
 ) -> Result<AppUsageData, PollError> {
     let mut data = AppUsageData::default();
@@ -215,7 +250,10 @@ fn poll_with(
 
     if show_codex {
         match poll_codex() {
-            Ok(codex) => data.codex = Some(codex),
+            Ok((codex, reset_credits_available)) => {
+                data.codex = Some(codex);
+                data.codex_reset_credits_available = reset_credits_available;
+            }
             Err(error) => {
                 if active_provider_count > 1 {
                     diagnose::log(format!("Codex usage poll failed: {error:?}"));
@@ -258,7 +296,7 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
     fetch_usage_with_fallback(&creds.access_token)
 }
 
-fn poll_codex() -> Result<UsageData, PollError> {
+fn poll_codex() -> CodexPoll {
     let creds = match read_codex_credentials() {
         Some(creds) => creds,
         None => {
@@ -273,6 +311,29 @@ fn poll_codex() -> Result<UsageData, PollError> {
             cli_refresh_codex_token();
             let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
             fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Fetch the rate limit resets Codex has granted this account. Kept apart from
+/// `poll`: the list changes on the order of weeks, so it is polled far less
+/// often than usage.
+pub fn poll_codex_reset_credits() -> Result<CodexResetCredits, PollError> {
+    let creds = match read_codex_credentials() {
+        Some(creds) => creds,
+        None => {
+            diagnose::log("Codex reset credit poll failed: no Codex credentials found");
+            return Err(PollError::NoCredentials);
+        }
+    };
+
+    match fetch_codex_reset_credits(&creds.access_token, creds.account_id.as_deref()) {
+        Ok(credits) => Ok(credits),
+        Err(PollError::AuthRequired) => {
+            cli_refresh_codex_token();
+            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
+            fetch_codex_reset_credits(&refreshed.access_token, refreshed.account_id.as_deref())
         }
         Err(error) => Err(error),
     }
@@ -828,7 +889,7 @@ fn parse_rate_limit_headers(response: &http::Response) -> UsageData {
     data
 }
 
-fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
+fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> CodexPoll {
     let mut request = http::get(CODEX_USAGE_URL)
         .header("Authorization", &format!("Bearer {token}"))
         .header("User-Agent", "codex-cli");
@@ -866,7 +927,143 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
         }
     };
 
-    codex_usage_from_response(response).ok_or(PollError::RequestFailed)
+    let reset_credits_available = codex_reset_credit_count(&response);
+    let usage = codex_usage_from_response(response).ok_or(PollError::RequestFailed)?;
+    Ok((usage, reset_credits_available))
+}
+
+fn codex_reset_credit_count(response: &CodexUsageResponse) -> Option<usize> {
+    let count = response
+        .rate_limit_reset_credits
+        .as_ref()?
+        .available_count
+        .filter(|count| *count >= 0)?;
+    Some(count as usize)
+}
+
+fn fetch_codex_reset_credits(
+    token: &str,
+    account_id: Option<&str>,
+) -> Result<CodexResetCredits, PollError> {
+    let mut request = http::get(CODEX_RESET_CREDITS_URL)
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("User-Agent", "codex-cli");
+
+    if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+
+    let resp = match request.call() {
+        Ok(resp) => resp,
+        Err(error) => {
+            diagnose::log_error("Codex reset credits endpoint request failed", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    let code = resp.status();
+    if is_auth_error(code) {
+        diagnose::log(format!(
+            "Codex reset credits endpoint returned auth error status {code}; refresh required"
+        ));
+        return Err(PollError::AuthRequired);
+    }
+
+    if !is_success(code) {
+        diagnose::log(format!(
+            "Codex reset credits endpoint returned status {code}"
+        ));
+        return Err(PollError::RequestFailed);
+    }
+
+    let response: CodexResetCreditsResponse = match resp.json() {
+        Some(response) => response,
+        None => {
+            diagnose::log("unable to parse Codex reset credits response");
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    Ok(codex_reset_credits_from_response(response))
+}
+
+fn codex_reset_credits_from_response(response: CodexResetCreditsResponse) -> CodexResetCredits {
+    if let Some(entries) = response.credits {
+        return CodexResetCredits {
+            expiries: entries
+                .iter()
+                .filter(|entry| entry.is_redeemable())
+                .map(|entry| parse_iso8601(entry.expires_at.as_deref()))
+                .collect(),
+        };
+    }
+
+    // No per-credit detail: all we can say is how many there are.
+    let count = response.available_count.unwrap_or(0).max(0) as usize;
+    CodexResetCredits {
+        expiries: vec![None; count],
+    }
+}
+
+/// One line per reset still in hand, soonest to lapse first: "8d23h". Credits the
+/// API gave no date for cannot be ordered, so they follow as a bare count.
+///
+/// Credits whose expiry has already passed are dropped here rather than at parse
+/// time, so a stale poll stops listing them the moment they lapse.
+pub fn reset_credit_lines(credits: &CodexResetCredits) -> Vec<String> {
+    let now = SystemTime::now();
+    let mut expiries: Vec<SystemTime> = credits
+        .expiries
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|expiry| *expiry > now)
+        .collect();
+    expiries.sort();
+
+    let mut lines: Vec<String> = expiries
+        .into_iter()
+        .map(|expiry| format_countdown(Some(expiry)))
+        .collect();
+
+    let undated = credits
+        .expiries
+        .iter()
+        .filter(|expiry| expiry.is_none())
+        .count();
+    if undated > 0 {
+        lines.push(undated.to_string());
+    }
+
+    lines
+}
+
+/// How long until any of the listed countdowns would read differently.
+pub fn reset_credits_time_until_display_change(credits: &CodexResetCredits) -> Option<Duration> {
+    credits
+        .expiries
+        .iter()
+        .filter_map(|expiry| time_until_display_change(*expiry))
+        .min()
+}
+
+/// Whether the credit list is worth re-reading: the count the usage response
+/// carries has moved, or a count has arrived while no list has been fetched yet.
+/// Only the list itself carries expiry dates, so the count alone cannot say when
+/// a reset lapses.
+pub fn reset_credits_need_refresh(
+    previous_count: Option<usize>,
+    current_count: Option<usize>,
+    have_list: bool,
+) -> bool {
+    let Some(count) = current_count else {
+        return false;
+    };
+
+    match previous_count {
+        Some(previous) => previous != count,
+        None => !have_list,
+    }
 }
 
 /// Windows longer than this belong in the weekly row, shorter ones in the 5h row.
@@ -1704,6 +1901,10 @@ mod tests {
         }
     }
 
+    fn codex_poll_with_session_percent(percentage: f64) -> CodexPoll {
+        Ok((usage_with_session_percent(percentage), None))
+    }
+
     #[test]
     fn claude_failure_does_not_block_codex_when_both_are_enabled() {
         let data = poll_with(
@@ -1711,7 +1912,7 @@ mod tests {
             true,
             false,
             || Err(PollError::AuthRequired),
-            || Ok(usage_with_session_percent(42.0)),
+            || codex_poll_with_session_percent(42.0),
             || unreachable!("antigravity is disabled"),
         )
         .expect("codex data should keep the poll successful");
@@ -1758,7 +1959,7 @@ mod tests {
             true,
             true,
             || unreachable!("claude code is disabled"),
-            || Ok(usage_with_session_percent(42.0)),
+            || codex_poll_with_session_percent(42.0),
             || Err(PollError::NoCredentials),
         )
         .expect("codex data should keep the poll successful");
@@ -1931,5 +2132,164 @@ mod tests {
 
         assert_eq!(usage.session.percentage, 7.0);
         assert_eq!(usage.weekly.percentage, 42.0);
+    }
+
+    fn codex_reset_credits(json: &str) -> CodexResetCredits {
+        let response: CodexResetCreditsResponse =
+            serde_json::from_str(json).expect("reset credits response should deserialize");
+        codex_reset_credits_from_response(response)
+    }
+
+    #[test]
+    fn codex_counts_only_the_credits_that_can_still_be_redeemed() {
+        let credits = codex_reset_credits(
+            r#"{
+                "credits": [
+                    {
+                        "id": "one",
+                        "status": "available",
+                        "is_supported_by_plan": true,
+                        "granted_at": "2026-07-13T17:25:40.438241Z",
+                        "expires_at": "2036-08-12T17:25:40.438241Z"
+                    },
+                    {
+                        "id": "two",
+                        "status": "redeemed",
+                        "is_supported_by_plan": true,
+                        "expires_at": "2036-09-12T17:25:40.438241Z"
+                    },
+                    {
+                        "id": "three",
+                        "status": "available",
+                        "is_supported_by_plan": false,
+                        "expires_at": "2036-09-12T17:25:40.438241Z"
+                    }
+                ],
+                "available_count": 1,
+                "total_earned_count": 0
+            }"#,
+        );
+
+        let lines = reset_credit_lines(&credits);
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with(strings::HOUR_SUFFIX));
+    }
+
+    #[test]
+    fn codex_lists_the_soonest_reset_to_lapse_first() {
+        let credits = codex_reset_credits(
+            r#"{
+                "credits": [
+                    {
+                        "id": "later",
+                        "status": "available",
+                        "expires_at": "2036-09-12T17:25:40Z"
+                    },
+                    {
+                        "id": "soonest",
+                        "status": "available",
+                        "expires_at": "2036-08-12T17:25:40Z"
+                    },
+                    {
+                        "id": "middle",
+                        "status": "available",
+                        "expires_at": "2036-08-30T17:25:40Z"
+                    }
+                ],
+                "available_count": 3
+            }"#,
+        );
+
+        let lines = reset_credit_lines(&credits);
+        assert_eq!(lines.len(), 3);
+
+        // Each line is a countdown, so the soonest to lapse is the shortest.
+        let days: Vec<u64> = lines
+            .iter()
+            .map(|line| {
+                line.split(strings::DAY_SUFFIX)
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .expect("a day count")
+            })
+            .collect();
+        let mut sorted = days.clone();
+        sorted.sort();
+        assert_eq!(days, sorted);
+    }
+
+    #[test]
+    fn codex_drops_credits_whose_expiry_has_already_passed() {
+        let credits = codex_reset_credits(
+            r#"{
+                "credits": [
+                    {
+                        "id": "lapsed",
+                        "status": "available",
+                        "expires_at": "2020-01-02T03:04:05Z"
+                    }
+                ],
+                "available_count": 1
+            }"#,
+        );
+
+        assert!(reset_credit_lines(&credits).is_empty());
+        assert_eq!(reset_credits_time_until_display_change(&credits), None);
+    }
+
+    #[test]
+    fn codex_usage_response_carries_the_reset_credit_count() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 70,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1786159990
+                    },
+                    "secondary_window": null
+                },
+                "rate_limit_reset_credits": {
+                    "available_count": 1,
+                    "applicable_available_count": 0
+                }
+            }"#,
+        )
+        .expect("usage response should deserialize");
+
+        assert_eq!(codex_reset_credit_count(&response), Some(1));
+    }
+
+    #[test]
+    fn codex_usage_response_without_reset_credits_reports_no_count() {
+        let response: CodexUsageResponse =
+            serde_json::from_str(r#"{ "rate_limit": null, "rate_limit_reset_credits": null }"#)
+                .expect("usage response should deserialize");
+
+        assert_eq!(codex_reset_credit_count(&response), None);
+    }
+
+    #[test]
+    fn reset_credit_list_is_refetched_only_when_the_count_moves() {
+        // Steady state: same count, list already in hand.
+        assert!(!reset_credits_need_refresh(Some(1), Some(1), true));
+        // Spent or granted: the expiry dates behind the count have changed.
+        assert!(reset_credits_need_refresh(Some(1), Some(0), true));
+        assert!(reset_credits_need_refresh(Some(0), Some(2), true));
+        // No count in the response says nothing either way.
+        assert!(!reset_credits_need_refresh(Some(1), None, true));
+        // First count seen, and no list yet - fetch one.
+        assert!(reset_credits_need_refresh(None, Some(1), false));
+        assert!(!reset_credits_need_refresh(None, Some(1), true));
+    }
+
+    #[test]
+    fn codex_falls_back_to_the_bare_count_without_a_credit_list() {
+        let credits = codex_reset_credits(r#"{ "available_count": 2 }"#);
+
+        // Nothing to order without dates, so the pair collapses to one count line.
+        assert_eq!(reset_credit_lines(&credits), vec!["2".to_string()]);
     }
 }

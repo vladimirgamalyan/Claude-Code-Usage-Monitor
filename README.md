@@ -14,6 +14,7 @@ It shows how much of your Claude Code, Codex, and/or Antigravity usage window yo
 - A **5h** bar for your current 5-hour Claude usage window
 - A **7d** bar for your current 7-day window
 - Optional Codex usage bars alongside Claude Code
+- A **↺** row per Codex rate limit reset you have in hand, counting down to when it expires, soonest first
 - Optional Antigravity model usage bars for Google's 5-hour and weekly Gemini quota windows
 - A live countdown until each limit resets
 - A small native window with a normal title bar that you can move anywhere and that remembers where you left it
@@ -73,6 +74,12 @@ Use the **Settings › Models** menu to choose what the window displays:
 
 When multiple models are shown, each model has its own usage bar and matching usage text color, and the window resizes to fit them. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed.
 
+### Codex Reset Credits
+
+Codex hands out occasional rate limit resets, each valid for a limited time. With Codex enabled, the window grows one **↺** row per reset you can still redeem, counting down to when it expires, for example `9d5h`. The nearest to expiring is listed first, and the rows disappear when you have none. If the window would outgrow the bottom of the screen, it moves up far enough to stay visible.
+
+Because resets are granted and spent by hand, they are checked far less often than usage. Use **Settings › Reset Credit Frequency** to choose between hourly, 6-hourly (the default), 12-hourly, and daily checks. This menu only appears while Codex is enabled.
+
 ## Diagnostics
 
 If you need to troubleshoot startup or visibility issues, run:
@@ -119,6 +126,7 @@ What the app sends over the network:
 
 - Requests to Anthropic's Claude endpoints to read your usage and rate-limit information
 - Requests to ChatGPT's Codex usage endpoint to read your Codex usage and rate-limit information, if Codex is enabled
+- Requests to ChatGPT's Codex reset credits endpoint to list the rate limit resets you have been granted and when they expire, if Codex is enabled. The app only ever reads this list; it never redeems a reset for you.
 - Requests to Google's Cloud Code / Antigravity endpoints to read your Antigravity quota information, if Antigravity is enabled
 - Nothing else: the app has no update check and never contacts GitHub at runtime
 - If proxy environment variables such as `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` are set, those outbound requests use that proxy, and `NO_PROXY` can exempt individual hosts
@@ -126,7 +134,7 @@ What the app sends over the network:
 What the app stores locally:
 
 - Window position
-- Polling frequency
+- Polling frequency, and how often Codex reset credits are checked
 - Displayed model preferences
 
 What it does **not** do:
