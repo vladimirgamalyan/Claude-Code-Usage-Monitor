@@ -1,6 +1,6 @@
 //! Every piece of user-visible text in the app. English only.
 
-pub const WINDOW_TITLE: &str = "Claude Code Usage Monitor";
+pub const WINDOW_TITLE: &str = "Usage Meter";
 pub const REFRESH: &str = "Refresh";
 pub const UPDATE_FREQUENCY: &str = "Update Frequency";
 pub const ONE_MINUTE: &str = "1 Minute";
@@ -33,5 +33,5 @@ pub const CODEX_TOKEN_EXPIRED_BODY: &str = "Run 'codex' in a terminal and follow
 pub const ANTIGRAVITY_TOKEN_EXPIRED_TITLE: &str = "Antigravity Auth Error";
 pub const ANTIGRAVITY_TOKEN_EXPIRED_BODY: &str =
     "Open Antigravity and sign in again. After that, refresh or restart this app.";
-pub const CODEX_WINDOW_TITLE: &str = "Codex Usage Monitor";
-pub const ANTIGRAVITY_WINDOW_TITLE: &str = "Antigravity Usage Monitor";
+pub const CODEX_WINDOW_TITLE: &str = "Codex Meter";
+pub const ANTIGRAVITY_WINDOW_TITLE: &str = "Antigravity Meter";

@@ -547,85 +547,125 @@ const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
 /// Wide enough for the longest countdown line, "100% · 23h59m".
 const TEXT_WIDTH: i32 = 86;
-const MODEL_RIGHT_MARGIN: i32 = 14;
 
 /// Padding between the window edges and the content.
 const CONTENT_PADDING_X: i32 = 16;
 const CONTENT_PADDING_Y: i32 = 14;
-/// Vertical gap between the 5h row and the 7d row.
-const ROW_GAP: i32 = 12;
-/// Keep the window wide enough for the caption text and the menu bar, even when
-/// a single model makes the content itself narrower than that.
-const MIN_CLIENT_WIDTH: i32 = 330;
+/// Vertical gap between two rows of the same model.
+const ROW_GAP: i32 = 8;
+/// Vertical gap between a model's heading and its first row.
+const HEADING_GAP: i32 = 5;
+/// Vertical gap between one model's block and the next.
+const BLOCK_GAP: i32 = 14;
+/// How far a model's rows sit in from its heading.
+const ROW_INDENT: i32 = 10;
+/// Keep the window wide enough for the menu bar. The caption text is left to
+/// fend for itself - Windows ellipsises it rather than padding the content out.
+const MIN_CLIENT_WIDTH: i32 = 200;
 
-/// How many rows the Codex resets in hand take up - one each.
-fn reset_row_count() -> i32 {
+/// A provider's block in the stacked layout.
+#[derive(Clone, Copy, PartialEq)]
+enum Model {
+    ClaudeCode,
+    Codex,
+    Antigravity,
+}
+
+/// The blocks on show, top to bottom. Never empty: the menu refuses to turn the
+/// last model off, and a settings file that says otherwise falls back to Claude.
+fn visible_models(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> Vec<Model> {
+    let mut models = Vec::new();
+    if show_claude_code {
+        models.push(Model::ClaudeCode);
+    }
+    if show_codex {
+        models.push(Model::Codex);
+    }
+    if show_antigravity {
+        models.push(Model::Antigravity);
+    }
+    if models.is_empty() {
+        models.push(Model::ClaudeCode);
+    }
+    models
+}
+
+/// The models on show and how many Codex reset rows ride along with them.
+fn visible_layout() -> (Vec<Model>, i32) {
     let state = lock_state();
-    state
-        .as_ref()
-        .filter(|s| s.show_codex)
-        .map(|s| s.codex_reset_lines.len() as i32)
-        .unwrap_or(0)
+    match state.as_ref() {
+        Some(s) => (
+            visible_models(s.show_claude_code, s.show_codex, s.show_antigravity),
+            if s.show_codex {
+                s.codex_reset_lines.len() as i32
+            } else {
+                0
+            },
+        ),
+        None => (visible_models(true, false, false), 0),
+    }
 }
 
-fn visible_row_count() -> i32 {
-    2 + reset_row_count()
+/// Headings only earn their vertical space when there is more than one block to
+/// tell apart - a lone model already names itself in the caption.
+fn headings_shown(models: &[Model]) -> bool {
+    models.len() > 1
 }
 
-/// Height of the drawn rows themselves, without the outer padding.
-fn content_height_for(rows: i32) -> i32 {
-    sc(SEGMENT_H) * rows + sc(ROW_GAP) * (rows - 1)
+fn row_indent(headings: bool) -> i32 {
+    if headings {
+        sc(ROW_INDENT)
+    } else {
+        0
+    }
 }
 
-/// Client height needed for every visible row plus padding, at the current DPI.
+/// Rows in a model's block: the two usage windows, plus one per Codex reset in
+/// hand.
+fn block_row_count(model: Model, reset_rows: i32) -> i32 {
+    match model {
+        Model::Codex => 2 + reset_rows,
+        _ => 2,
+    }
+}
+
+/// Height of the drawn blocks themselves, without the outer padding.
+fn content_height_for(models: &[Model], reset_rows: i32) -> i32 {
+    let seg_h = sc(SEGMENT_H);
+    let headings = headings_shown(models);
+    let mut height = 0;
+    for (index, model) in models.iter().enumerate() {
+        if index > 0 {
+            height += sc(BLOCK_GAP);
+        }
+        if headings {
+            height += seg_h + sc(HEADING_GAP);
+        }
+        let rows = block_row_count(*model, reset_rows);
+        height += seg_h * rows + sc(ROW_GAP) * (rows - 1);
+    }
+    height
+}
+
+/// Client height needed for every visible block plus padding, at the current DPI.
 fn client_height() -> i32 {
-    sc(CONTENT_PADDING_Y) * 2 + content_height_for(visible_row_count())
+    let (models, reset_rows) = visible_layout();
+    sc(CONTENT_PADDING_Y) * 2 + content_height_for(&models, reset_rows)
 }
 
 /// Client width at the current DPI: the content, or the minimum if wider.
 fn client_width() -> i32 {
-    content_width().max(sc(MIN_CLIENT_WIDTH))
+    let (models, _) = visible_layout();
+    content_width_for(headings_shown(&models)).max(sc(MIN_CLIENT_WIDTH))
 }
 
 /// Width of the drawn content itself, without the outer padding.
-fn content_inner_width() -> i32 {
-    content_width() - sc(CONTENT_PADDING_X) * 2
+fn content_inner_width(headings: bool) -> i32 {
+    row_indent(headings) + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN) + model_usage_width()
 }
 
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
-    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
-}
-
-fn row_bar_segment_count(active_models: i32) -> i32 {
-    match active_models {
-        1 => SEGMENT_COUNT,
-        2 => 5,
-        _ => 4,
-    }
-}
-
-fn content_width_for(active_models: i32) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH);
-
-    sc(CONTENT_PADDING_X) * 2
-        + sc(LABEL_WIDTH)
-        + sc(LABEL_RIGHT_MARGIN)
-        + model_width * active_models
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-}
-
-fn content_width() -> i32 {
-    let active_models = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or(1)
-    };
-    content_width_for(active_models)
+fn content_width_for(headings: bool) -> i32 {
+    sc(CONTENT_PADDING_X) * 2 + content_inner_width(headings)
 }
 
 fn claude_accent_color() -> Color {
@@ -665,6 +705,30 @@ fn antigravity_usage_text_color(is_dark: bool) -> Color {
         Color::from_hex("#8AB4F8")
     } else {
         Color::from_hex("#1967D2")
+    }
+}
+
+fn model_accent_color(model: Model, is_dark: bool) -> Color {
+    match model {
+        Model::ClaudeCode => claude_accent_color(),
+        Model::Codex => codex_accent_color(is_dark),
+        Model::Antigravity => antigravity_accent_color(),
+    }
+}
+
+fn model_usage_text_color(model: Model, is_dark: bool) -> Color {
+    match model {
+        Model::ClaudeCode => claude_usage_text_color(is_dark),
+        Model::Codex => codex_usage_text_color(is_dark),
+        Model::Antigravity => antigravity_usage_text_color(is_dark),
+    }
+}
+
+fn model_heading(model: Model) -> &'static str {
+    match model {
+        Model::ClaudeCode => strings::CLAUDE_CODE_MODEL,
+        Model::Codex => strings::CODEX_MODEL,
+        Model::Antigravity => strings::ANTIGRAVITY_MODEL,
     }
 }
 
@@ -730,14 +794,16 @@ pub fn run() {
             settings.show_codex,
             settings.show_antigravity,
         ));
-        let initial_model_count = active_model_count(
+        // The shared state does not exist yet, so size the window off the
+        // settings and leave the reset rows to the first resize.
+        let initial_models = visible_models(
             settings.show_claude_code,
             settings.show_codex,
             settings.show_antigravity,
         );
         let (window_width, window_height) = window_size_for_client(
-            content_width_for(initial_model_count).max(sc(MIN_CLIENT_WIDTH)),
-            client_height(),
+            content_width_for(headings_shown(&initial_models)).max(sc(MIN_CLIENT_WIDTH)),
+            sc(CONTENT_PADDING_Y) * 2 + content_height_for(&initial_models, 0),
         );
         let restored_position = match (settings.window_x, settings.window_y) {
             (Some(x), Some(y)) if position_is_visible(x, y, window_width, window_height) => {
@@ -904,7 +970,7 @@ fn activate_running_instance(class_name: &[u16]) {
     }
 }
 
-/// Paint the usage rows onto a DC with a given background color.
+/// Paint the stacked model blocks onto a DC with a given background color.
 fn paint_content(
     hdc: HDC,
     width: i32,
@@ -912,7 +978,6 @@ fn paint_content(
     is_dark: bool,
     bg: &Color,
     text_color: &Color,
-    accent: &Color,
     track: &Color,
     session_pct: f64,
     session_text: &str,
@@ -930,8 +995,6 @@ fn paint_content(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -945,95 +1008,125 @@ fn paint_content(
         FillRect(hdc, &client_rect, bg_brush);
         let _ = DeleteObject(bg_brush);
 
+        let models = visible_models(show_claude_code, show_codex, show_antigravity);
+        let headings = headings_shown(&models);
+        let reset_rows = if show_codex {
+            codex_reset_lines.len() as i32
+        } else {
+            0
+        };
+
         // Centre the content so it stays balanced when the window is wider than
         // the content needs, or a pixel or two taller than we asked for.
-        let rows = 2 + codex_reset_lines.len() as i32;
-        let content_h = content_height_for(rows);
-        let content_x = ((width - content_inner_width()) / 2).max(sc(CONTENT_PADDING_X));
-        let row1_y = ((height - content_h) / 2).max(sc(CONTENT_PADDING_Y));
-        let row_pitch = sc(SEGMENT_H) + sc(ROW_GAP);
-        let row2_y = row1_y + row_pitch;
+        let content_h = content_height_for(&models, reset_rows);
+        let content_x = ((width - content_inner_width(headings)) / 2).max(sc(CONTENT_PADDING_X));
+        let mut y = ((height - content_h) / 2).max(sc(CONTENT_PADDING_Y));
+        let seg_h = sc(SEGMENT_H);
+        let row_x = content_x + row_indent(headings);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
         let font_name = native_interop::wide_str("Segoe UI");
-        let font = CreateFontW(
-            sc(-12),
-            0,
-            0,
-            0,
-            FW_MEDIUM.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(font_name.as_ptr()),
-        );
+        let make_font = |weight: FONT_WEIGHT| {
+            CreateFontW(
+                sc(-12),
+                0,
+                0,
+                0,
+                weight.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_TT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                CLEARTYPE_QUALITY.0 as u32,
+                (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                PCWSTR::from_raw(font_name.as_ptr()),
+            )
+        };
+        let font = make_font(FW_MEDIUM);
+        let heading_font = make_font(FW_SEMIBOLD);
         let old_font = SelectObject(hdc, font);
 
-        draw_row(
-            hdc,
-            content_x,
-            row1_y,
-            is_dark,
-            text_color,
-            strings::SESSION_WINDOW,
-            session_pct,
-            session_text,
-            codex_session_pct,
-            codex_session_text,
-            antigravity_session_pct,
-            antigravity_session_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
-            track,
-        );
-        draw_row(
-            hdc,
-            content_x,
-            row2_y,
-            is_dark,
-            text_color,
-            strings::WEEKLY_WINDOW,
-            weekly_pct,
-            weekly_text,
-            codex_weekly_pct,
-            codex_weekly_text,
-            antigravity_weekly_pct,
-            antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
-            track,
-        );
-        for (index, reset_text) in codex_reset_lines.iter().enumerate() {
-            draw_reset_row(
+        for (index, model) in models.iter().enumerate() {
+            let model = *model;
+            if index > 0 {
+                y += sc(BLOCK_GAP);
+            }
+
+            // A lone model keeps the neutral text colour it has always had;
+            // stacked ones are told apart by their own.
+            let value_color = if headings {
+                model_usage_text_color(model, is_dark)
+            } else {
+                *text_color
+            };
+            let accent = model_accent_color(model, is_dark);
+
+            if headings {
+                SelectObject(hdc, heading_font);
+                draw_heading(hdc, content_x, y, model_heading(model), &value_color);
+                SelectObject(hdc, font);
+                y += seg_h + sc(HEADING_GAP);
+            }
+
+            let (session_pct, session_text, weekly_pct, weekly_text) = match model {
+                Model::ClaudeCode => (session_pct, session_text, weekly_pct, weekly_text),
+                Model::Codex => (
+                    codex_session_pct,
+                    codex_session_text,
+                    codex_weekly_pct,
+                    codex_weekly_text,
+                ),
+                Model::Antigravity => (
+                    antigravity_session_pct,
+                    antigravity_session_text,
+                    antigravity_weekly_pct,
+                    antigravity_weekly_text,
+                ),
+            };
+
+            draw_usage_row(
                 hdc,
-                content_x,
-                row2_y + row_pitch * (index as i32 + 1),
-                is_dark,
+                row_x,
+                y,
                 text_color,
-                reset_text,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
+                strings::SESSION_WINDOW,
+                session_pct,
+                session_text,
+                &accent,
+                track,
+                &value_color,
             );
+            y += seg_h + sc(ROW_GAP);
+            draw_usage_row(
+                hdc,
+                row_x,
+                y,
+                text_color,
+                strings::WEEKLY_WINDOW,
+                weekly_pct,
+                weekly_text,
+                &accent,
+                track,
+                &value_color,
+            );
+            y += seg_h;
+
+            if model == Model::Codex {
+                for reset_text in codex_reset_lines {
+                    y += sc(ROW_GAP);
+                    draw_reset_row(hdc, row_x, y, text_color, reset_text, &value_color);
+                    y += seg_h;
+                }
+            }
         }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
+        let _ = DeleteObject(heading_font);
     }
 }
 
@@ -1938,9 +2031,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
             None => return,
         }
     };
-    let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
-    let antigravity_accent = antigravity_accent_color();
     let track = if is_dark {
         Color::from_hex("#444444")
     } else {
@@ -1978,7 +2068,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
             is_dark,
             &bg_color,
             &text_color,
-            &accent,
             &track,
             session_pct,
             &session_text,
@@ -1996,8 +2085,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_antigravity,
-            &codex_accent,
-            &antigravity_accent,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -2008,159 +2095,66 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
-fn draw_row(
-    hdc: HDC,
-    x: i32,
-    y: i32,
-    is_dark: bool,
-    text_color: &Color,
-    label: &str,
-    claude_percent: f64,
-    claude_text: &str,
-    codex_percent: f64,
-    codex_text: &str,
-    antigravity_percent: f64,
-    antigravity_text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    claude_accent: &Color,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
-    track: &Color,
-) {
-    let seg_h = sc(SEGMENT_H);
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-    let segment_count = row_bar_segment_count(active_models);
-    let use_model_text_colors = active_models > 1;
-    let claude_value_color = if use_model_text_colors {
-        claude_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let codex_value_color = if use_model_text_colors {
-        codex_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let antigravity_value_color = if use_model_text_colors {
-        antigravity_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-
+/// The name a block of rows belongs to, drawn above them in the model's colour.
+fn draw_heading(hdc: HDC, x: i32, y: i32, text: &str, color: &Color) {
     unsafe {
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-        let mut label_rect = RECT {
+        let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+        let mut rect = RECT {
             left: x,
             top: y,
-            right: x + sc(LABEL_WIDTH),
-            bottom: y + seg_h,
+            right: x + content_inner_width(true),
+            bottom: y + sc(SEGMENT_H),
         };
         let _ = DrawTextW(
             hdc,
-            &mut label_wide,
-            &mut label_rect,
+            &mut text_wide,
+            &mut rect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
-
-        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                claude_percent,
-                claude_text,
-                claude_accent,
-                track,
-                &claude_value_color,
-            );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_codex {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                codex_accent,
-                track,
-                &codex_value_color,
-            );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                antigravity_percent,
-                antigravity_text,
-                antigravity_accent,
-                track,
-                &antigravity_value_color,
-            );
-        }
     }
 }
 
-/// The resets-in-hand row: no bar to fill, just the count and how long the
-/// soonest credit has left, aligned under the Codex column's usage text.
-fn draw_reset_row(
+/// One usage window of one model: its label, the segmented bar and the text.
+fn draw_usage_row(
     hdc: HDC,
     x: i32,
     y: i32,
-    is_dark: bool,
-    text_color: &Color,
+    label_color: &Color,
+    label: &str,
+    percent: f64,
     text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
+    accent: &Color,
+    track: &Color,
+    value_color: &Color,
 ) {
-    let seg_h = sc(SEGMENT_H);
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-    let segment_count = row_bar_segment_count(active_models);
-    let value_color = if active_models > 1 {
-        codex_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
+    draw_row_label(hdc, x, y, label, label_color);
+    draw_usage_bar(
+        hdc,
+        x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN),
+        y,
+        percent,
+        text,
+        accent,
+        track,
+        value_color,
+    );
+}
 
+/// The resets-in-hand row: no bar to fill, just the count and how long the
+/// soonest credit has left, aligned under the usage text above it.
+fn draw_reset_row(hdc: HDC, x: i32, y: i32, label_color: &Color, text: &str, value_color: &Color) {
     unsafe {
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = strings::RESET_CREDIT_WINDOW.encode_utf16().collect();
-        let mut label_rect = RECT {
-            left: x,
-            top: y,
-            right: x + sc(LABEL_WIDTH),
-            bottom: y + seg_h,
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
+        draw_row_label(hdc, x, y, strings::RESET_CREDIT_WINDOW, label_color);
 
-        let mut column_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
-            column_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-
-        let text_x = column_x + segment_count * (sc(SEGMENT_W) + sc(SEGMENT_GAP)) - sc(SEGMENT_GAP)
-            + sc(BAR_RIGHT_MARGIN);
+        let text_x =
+            x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN) + bar_width() + sc(BAR_RIGHT_MARGIN);
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut text_rect = RECT {
             left: text_x,
             top: y,
             right: text_x + sc(TEXT_WIDTH),
-            bottom: y + seg_h,
+            bottom: y + sc(SEGMENT_H),
         };
         let _ = SetTextColor(hdc, COLORREF(value_color.to_colorref()));
         let _ = DrawTextW(
@@ -2172,17 +2166,39 @@ fn draw_reset_row(
     }
 }
 
-fn model_usage_width(segment_count: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH)
+fn draw_row_label(hdc: HDC, x: i32, y: i32, label: &str, color: &Color) {
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+        let mut label_rect = RECT {
+            left: x,
+            top: y,
+            right: x + sc(LABEL_WIDTH),
+            bottom: y + sc(SEGMENT_H),
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut label_wide,
+            &mut label_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+}
+
+/// Width of the bar alone, without the usage text beside it.
+fn bar_width() -> i32 {
+    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * SEGMENT_COUNT - sc(SEGMENT_GAP)
+}
+
+/// Width of a model's bar and the usage text that follows it.
+fn model_usage_width() -> i32 {
+    bar_width() + sc(BAR_RIGHT_MARGIN) + sc(TEXT_WIDTH)
 }
 
 fn draw_usage_bar(
     hdc: HDC,
     bar_x: i32,
     y: i32,
-    segment_count: i32,
     percent: f64,
     text: &str,
     accent: &Color,
@@ -2196,9 +2212,9 @@ fn draw_usage_bar(
 
     unsafe {
         let percent_clamped = percent.clamp(0.0, 100.0);
-        let segment_percent = 100.0 / segment_count as f64;
+        let segment_percent = 100.0 / SEGMENT_COUNT as f64;
 
-        for i in 0..segment_count {
+        for i in 0..SEGMENT_COUNT {
             let seg_x = bar_x + i * (seg_w + seg_gap);
             let seg_start = (i as f64) * segment_percent;
             let seg_end = seg_start + segment_percent;
@@ -2243,7 +2259,7 @@ fn draw_usage_bar(
             }
         }
 
-        let text_x = bar_x + segment_count * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
+        let text_x = bar_x + bar_width() + sc(BAR_RIGHT_MARGIN);
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut text_rect = RECT {
             left: text_x,
